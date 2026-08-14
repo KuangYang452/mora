@@ -64,17 +64,10 @@ def load_llm_config() -> dict:
     except settings.ConfigError as exc:
         raise ChatError(str(exc))
 
-def _reasoning_enabled() -> bool:
-    """思考模式开关：以 setting/llm.ini 的 reasoning 为准（LLM 配置唯一来源）。
-
-    thinking.type=disabled 时：不注入思维链提示词（thinking_style_for 返回空、
-    build_activation 不追加心理 COT），并禁用 fetish_analysis（心理分析依赖推理
-    链，无思考时工具描述/白名单/技能注入一并剔除）。配置读失败按开启处理（不丢推理）。
-    """
-    try:
-        return bool(load_llm_config().get("reasoning", True))
-    except Exception:
-        return True
+# 原生思考模式（setting/llm.ini 的 reasoning → API thinking.type）只控制 DeepSeek
+# 是否返回隐藏推理块，与推理内容解耦：工具循环内的推理走 think 工具通道
+# （think 是通用工具，始终注册、不随 reasoning 变化），思维链风格指令 / 心理COT /
+# fetish_analysis 技能因此不依赖原生思考模式，reasoning 开闭都不影响它们。
 
 # ---------------------------------------------------------------------------
 # 角色卡解析
@@ -150,20 +143,20 @@ def activation_instruction() -> str:
     行为细节（台词规范/状态更新/工具用法/自主推进）以系统提示词
     【每回合的行为方式】与【输出红线】为权威；本指令只做开场与引用，
     不重复规则全文——避免同一条规则在上下文两处出现、模型对
-    「哪处为准」产生歧义。GAME_RULES 全文只由行为协议段注入一次。
+    「哪处为准」产生歧义。GAME_RULES 全文只由游戏环境段
+    （env_section 的【游戏点评规则】）注入一次。
     rmgame 关闭时游戏点评工具未注册，引用句一并隐藏。
     """
     text = (
         f"现在，请以{_CHAR.identity}的身份，对{USER_REFERENCE}作出回应。\n"
-        "你的台词通过 say 工具说出，状态通过 update_state 工具更新；"
+        "你的内部思考通过 think 工具进行，台词通过 say 工具说出，状态通过 update_state 工具更新；"
         "台词、状态与其他工具的具体要求，以系统提示词"
         "【每回合的行为方式】与【输出红线】为准。\n"
     )
     if CONFIG.get("rmgame_enabled", True):
         text += (
-            "对方正在玩 RPG Maker 游戏时，回答前先按系统提示词"
-            "【每回合的行为方式】中「游戏点评」小节的先查再答规则执行，"
-            "不得凭空脑补游戏设定。\n"
+            "对方正在玩 RPG Maker 游戏时，回答前先按随游戏环境段注入的"
+            "【游戏点评规则】执行先查再答，不得凭空脑补游戏设定。\n"
         )
     return text
 
@@ -174,9 +167,12 @@ def activation_instruction() -> str:
 # - 未激活 → 角色沉浸要求（角色扮演式思维链）
 # 文本借鉴仓库原文的精神而非照抄：前两条形式规则保留原文，第 3 条贴合本场景
 # （思维模式要求 → 心理分析；角色沉浸要求 → 角色扮演式内心戏）。
+# 原版指令指向原生思考块（<think>），但本项目工具循环内的推理通道是 think 工具
+# （DeepSeek 工具调用与原生思维链互斥，工具循环内没有 reasoning_content 通道）——
+# 指令改指 think 工具记录的内容，风格规则照常约束模型在 think 调用中如何思考。
 THINKING_STYLE_INSTRUCT = {
     "logical": (
-        "【思维模式要求】在你的思考过程（<think>标签内）中，请遵守以下规则：\n"
+        "【思维模式要求】在你的思考（think 工具记录）中，请遵守以下规则：\n"
         "1. 禁止使用圆括号包裹内心独白，例如\"（心想：……）\"或\"(内心OS：……)\"，"
         "所有分析内容直接陈述即可\n"
         "2. 禁止以角色第一人称描写内心活动，例如\"我心想\"\"我觉得\"\"我暗自\"等，"
@@ -186,7 +182,7 @@ THINKING_STYLE_INSTRUCT = {
         "角色扮演式的内心戏表演"
     ),
     "immersion": (
-        "【角色沉浸要求】在你的思考过程（<think>标签内）中，请遵守以下规则：\n"
+        "【角色沉浸要求】在你的思考（think 工具记录）中，请遵守以下规则：\n"
         "1. 请以角色第一人称进行内心独白，用括号包裹内心活动，"
         "例如\"（心想：……）\"或\"(内心OS：……)\"\n"
         "2. 用第一人称描写角色的内心感受，例如\"我心想\"\"我觉得\"\"我暗自\"等\n"
@@ -199,17 +195,13 @@ THINKING_STYLE_INSTRUCT = {
 }
 
 
-def thinking_style_for(state: dict = None, thinking: bool = None) -> str:
+def thinking_style_for(state: dict = None) -> str:
     """按技能状态选择思维链风格指令：激活 fetish_analysis → 推理式，否则角色沉浸式。
 
     返回的指令文本注入到第一条 user 消息末尾（build_messages 的 first_user_instr）。
-    thinking=None 时以 setting/llm.ini 的 reasoning 为准；思考模式关闭时返回空串
-    （不注入思维链提示词，避免指令指向不存在的 reasoning_content 通道）。
+    指令作用于 think 工具记录的内容（工具循环内的推理通道），与原生思考模式
+    （setting/llm.ini 的 reasoning → thinking.type）无关，始终注入。
     """
-    if thinking is None:
-        thinking = _reasoning_enabled()
-    if not thinking:
-        return ""
     state = state or {}
     if "fetish_analysis" in (state.get("skills") or []):
         return THINKING_STYLE_INSTRUCT["logical"]
@@ -233,26 +225,27 @@ COT_ADAPT = (
 )
 
 
-def build_activation(state: dict = None, card: dict = None, thinking: bool = None) -> str:
-    """完整激活指令 = activation_instruction() [+ 心理 COT（<think> 包裹，仅激活时）]。
+def build_activation(state: dict = None, card: dict = None) -> str:
+    """完整激活指令 = activation_instruction() [+ 心理 COT（<thinking_format> 包裹，仅激活时）]。
 
     心理 COT 内容取自原型「心理COT」世界书条目（_psych_cot），占位符已实例化；
     原型步骤后追加 COT_ADAPT（素材来源 + 收敛判断），以 <thinking_format> 标签包裹，
-    明确推理只用于内部思考（reasoning_content），不写入 say 台词或工具参数。
-    thinking=None 时以 setting/llm.ini 的 reasoning 为准；思考模式关闭时心理 COT
-    不注入（分析依赖推理链，无思考则无从分析，且 fetish_analysis 已被禁用）。
+    明确推理只通过 think 工具记录（think 是工具循环内的推理通道——DeepSeek 工具
+    调用与原生思维链互斥，工具循环内无 reasoning_content 通道），
+    不写入 say 台词或其他工具参数。
+    心理 COT 不依赖原生思考模式（setting/llm.ini 的 reasoning）：think 工具通道
+    始终可用，fetish_analysis 激活即注入，reasoning 开闭不影响。
     """
     act = activation_instruction()
     state = state or {}
-    if thinking is None:
-        thinking = _reasoning_enabled()
-    if thinking and "fetish_analysis" in (state.get("skills") or []) and card:
+    if "fetish_analysis" in (state.get("skills") or []) and card:
         cot_title, cot_body = _psych_cot(card)
         if cot_body:
             act += (
                 "\n\n<thinking_format>\n"
-                f"在思考阶段按以下步骤完成心理分析推理；推理只用于内部思考"
-                "（reasoning_content），不得写入 say 台词或工具参数。\n"
+                f"在思考阶段按以下步骤完成心理分析推理；推理只通过 think 工具记录"
+                "（DeepSeek 工具调用与思维链互斥，工具循环内没有 reasoning_content "
+                "通道），不得写入 say 台词或其他工具参数。\n"
                 "必须完整走完所有步骤（含最后的收敛判断）后再输出台词，"
                 "不得跳过思考直接回复。\n\n"
                 + cot_body
@@ -349,17 +342,24 @@ def _adapt_style(text: str) -> str:
         text, flags=re.S)
 
 
-def _semantic_state(state: dict) -> str:
+def _semantic_state(state: dict, with_affection: bool = True) -> str:
     """把状态数据转成语义化叙述，不暴露任何代码结构。
 
-    不含当前时间：时间锚点由 ContextManager.build_messages 作为上下文开头
-    的独立【当前时间】消息注入（唯一来源），状态段不重复，避免双时间源。
+    with_affection=True：含好感度数值（工具结果回传用——结算反馈需展示
+    数值变化）；False：隐去数值只留等级（system 状态段用——数值逐次变化、
+    模型无法直接读写，等级才是行为依据；隐去后该段仅在跨等级时变化，
+    尽量静态）。
+    不含当前时间：时间锚点由 ContextManager.build_messages 在消息序列
+    后部（激活指令之前）以独立【当前时间】消息注入（唯一来源），
+    状态段不重复，避免双时间源。
     """
     aff = int(state.get("affection", INITIAL_STATE["affection"]))
     level = level_for(aff)
     thought = state.get("inner_thought") or INITIAL_STATE["inner_thought"]
+    rel = (f"好感度 {aff}/100，处于「{level}」阶段"
+           if with_affection else f"处于「{level}」阶段")
     return (
-        f"此刻你与{USER_REFERENCE}的关系：好感度 {aff}/100，处于「{level}」阶段。\n"
+        f"此刻你与{USER_REFERENCE}的关系：{rel}。\n"
         f"你的内心想法：{thought}"
     )
 
@@ -469,24 +469,85 @@ def _env_section(env: dict) -> str or None:
             + "\n".join(lines) + "\n</game_environment>")
 
 
-def build_system_prompt(card: dict, state: dict = None, env: dict = None,
-                        thinking: bool = None, agent_turn: tuple = None) -> str:
-    """把角色卡原文 + 语义化状态（+ 可选游戏环境）组装为系统提示词。
+# ---------------------------------------------------------------------------
+# 动态尾部段（移出 system prompt，由 pet.py 经 build_messages(pre_time=)
+# 在历史之后、时间锚点之前注入）：
+# - 【当前状态】：内心想法高频变化（模型每轮更新）；
+# - 【对方正在…】：游戏环境快照持续变化；
+# - 【本回合推进】：轮次计数每轮必变。
+# 三者若留在 system prompt 内，会在协议段与历史段之前切断缓存前缀
+# （静态在前、动态在后），故整体后置。
+# ---------------------------------------------------------------------------
 
-    agent_turn=(turn, max_turns) 时注入【本回合推进】动态段（多轮工具循环中
-    每轮重建时带上），引导模型按「规划 → 推进 → 交付」自发收敛。
-    
+def state_section(state: dict = None) -> str:
+    """当前状态段（动态尾部注入）：语义化状态叙述，好感度数值隐去。"""
+    return "【当前状态】\n" + _semantic_state(state, with_affection=False)
 
+
+def env_section(env: dict) -> str or None:
+    """游戏环境快照段（动态尾部注入）：环境语义化叙述 + 【游戏点评规则】。
+
+    环境快照随游戏画面高频变化；GAME_RULES 全文（data.GAME_RULES，单一
+    事实来源）紧随其后注入——从行为协议段移出，使静态 system prompt
+    不随游戏启停变化（缓存前缀稳定）。无有效环境信息返回 None。
+    """
+    seg = _env_section(env)
+    if not seg:
+        return None
+    if CONFIG.get("rmgame_enabled", True):
+        rules = "【游戏点评规则】（对方正在玩 RPG Maker 游戏时生效）\n" + GAME_RULES
+        wb = (SKILLS.get("game_context", {}) or {}).get("world_book") or ""
+        if wb:
+            rules += "\n" + wb
+        seg = seg + "\n\n" + rules
+    return seg
+
+
+def turn_section(agent_turn: tuple) -> str or None:
+    """本回合推进节奏段（动态尾部注入，多轮工具循环中每轮重建时带上），
+    引导模型按「规划 → 推进 → 交付」自发收敛——首轮给完整纪律与轮次
+    预算，后续轮逐步收紧，末轮强制交付。agent_turn=None 返回 None。
+    """
+    if agent_turn is None:
+        return None
+    turn, max_turns = agent_turn
+    max_turns = max(1, int(max_turns))
+    if turn >= max_turns:
+        rhythm = (f"本回合已到第 {turn}/{max_turns} 轮（上限）。"
+                  "请直接调用 say 工具说出台词交付，不要再调用其他工具。")
+    elif turn <= 1:
+        rhythm = (f"本回合你最多可自主推进 {max_turns} 轮工具调用。"
+                  "建议节奏：需要多轮查证时，先用 think 写下分析计划与"
+                  "待验证要点，再将查询工具一次性批量调用（可在同一轮同时"
+                  "调用多个）；每轮得出关键结论后更新 think，"
+                  "基于结果组织台词后，信息足够立即调用 say 交付；"
+                  "不要零散地一次只查一项，也不要为查而查。")
+    else:
+        rhythm = (f"本回合已进行 {turn - 1} 轮。若信息已足够，"
+                  "请直接调用 say 说出台词交付；"
+                  "仅当关键信息仍缺失时再调用查询工具。")
+    return "【本回合推进】\n" + rhythm
+
+
+def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str:
+    """把角色卡原文 + 语义化状态组装为系统提示词（只含静态内容）。
+
+    身份/性格/情境/记忆/好感等级规则/技能/行为协议。**输出与 env 无关**：
+    env 参数仅作契约占位（游戏环境信息全部由 env_section 在动态尾部注入，
+    game_context 的 world_book 与 GAME_RULES 全文随其【游戏点评规则】段），
+    自测以 prompt_env == sys_prompt 断言保护——缓存前缀不随游戏启停变化。
+    动态内容（【当前状态】/【对方正在…】/【本回合推进】）由 state_section /
+    env_section / turn_section 生成、经调用方在消息序列后部注入（见
+    ContextManager.build_messages 的 pre_time 参数）——避免在 system prompt
+    内出现高频变化文本而切断缓存前缀。
     原则：
     - 角色卡怎么写就怎么用——不删减、不改写、不做内容过滤。
     - 状态只以语义化叙述出现（_semantic_state），LLM 看不到任何结构。
     - 输出协议：LLM 一切输出走原生工具调用（function calling），
       字段权限在提示词中语义化说明。
-    - thinking=None 以 setting/llm.ini 的 reasoning 为准；思考模式关闭时
-      技能清单与已激活技能均剔除 fetish_analysis（心理分析依赖推理链）。
+    - 技能注入不依赖原生思考模式（setting/llm.ini 的 reasoning）：推理通道是
+      think 工具（始终可用），fetish_analysis 在激活时照常注入。
     """
-    if thinking is None:
-        thinking = _reasoning_enabled()
     state = state or dict(INITIAL_STATE)
     parts = []
 
@@ -545,33 +606,13 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None,
     if level_text:
         parts.append("【好感等级规则】\n" + level_text)
     active_skills = list(state.get("skills") or [])
-    if not thinking:
-        # 思考模式关闭：心理分析技能不可用（依赖推理链），从注入与清单一并剔除
-        active_skills = [s for s in active_skills if s != "fetish_analysis"]
-    # 环境驱动：对方正在玩游戏（【对方正在…】环境段存在）→ 自动激活
-    # game_context 技能，不必等 LLM 通过工具声明（确保点评前会读上下文）
-    if env and env.get("game") and "game_context" not in active_skills:
-        active_skills.append("game_context")
-    if active_skills:
-        # 按技能名精确注入，不再整表拖带：角色卡技能世界书（<Fetish_analysys>）
-        # 仅在 fetish_analysis 激活时注入；game_context 只注入其内置 world_book。
-        seg = []
-        if "fetish_analysis" in active_skills and skills:
-            seg.extend(skills)                 # 角色卡技能世界书（性癖分析指导+理论）
-        gc_wb = SKILLS.get("game_context", {}).get("world_book")
-        if ("game_context" in active_skills and gc_wb
-                and CONFIG.get("rmgame_enabled", True)):
-            seg.append(gc_wb)                  # 程序内置：游戏上下文读取指导
-        if seg:
-            parts.append("【已激活技能】\n" + "\n\n".join(seg))
-
-    # 状态层（每回合刷新）
-    parts.append("【当前状态】\n" + _semantic_state(state))
-
-    # 环境层（动态，可选）：对方正在玩的 RPG Maker 游戏实时环境
-    env_seg = _env_section(env) if env else None
-    if env_seg:
-        parts.append(env_seg)
+    # 技能段注入：仅 fetish_analysis 的角色卡世界书（<Fetish_analysys>）
+    # 进入静态 system prompt（按 state.skills 精确注入，不整表拖带）。
+    # game_context 不在此注入：其 world_book 与 GAME_RULES 全文随游戏环境段
+    # （env_section 的【游戏点评规则】）注入，使静态 system prompt 输出与
+    # env 无关、不随游戏启停出现/消失（缓存前缀稳定）。
+    if "fetish_analysis" in active_skills and skills:
+        parts.append("【已激活技能】\n" + "\n\n".join(skills))
 
     # 行为协议：台词与状态更新都走原生工具调用（function calling）。
     # 激活指令由 ContextManager 作为对话上下文之后的独立 system 消息附加。
@@ -583,10 +624,6 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None,
     listed_skills = SKILLS
     if not CONFIG.get("rmgame_enabled", True):
         listed_skills = {k: v for k, v in SKILLS.items() if k != "game_context"}
-    if not thinking:
-        # 思考模式关闭：技能清单不出现 fetish_analysis（模型无从知晓/声明）
-        listed_skills = {k: v for k, v in listed_skills.items()
-                         if k != "fetish_analysis"}
     tools_desc = "、".join(
         f"「{t.name}」" for t in listed_tools if t.name != "say")
     skills_desc = "、".join(
@@ -602,6 +639,22 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None,
         "  · inner_thought：你的内心想法（一句话），可自主更新。\n"
         "  · emote / bounce：情绪与动作。\n"
         "  · skills：技能开关。" + skills_desc + "，用不到就传空数组。\n"
+        "- 思考：多轮推进时调用 think 工具记录你的分析框架与跨轮结论——"
+        "开始前先写下计划/待验证要点，每轮查询得出关键结论后更新它"
+        "（查询/工具结果只保留最近一轮，更早的结果不再保留，"
+        "需要跨轮引用的结论必须经 think 保留）。"
+        "你的完整思路链会以思考块呈现在对话中：块首是思考标记，块内按轮次"
+        "累积你的 think 文本，查询/读取类工具调用以单行反引号追加在链内"
+        "（如 `query_archive:关键词`；update_state 状态更新不入链，"
+        "其效果经工具结果回传）；块保持开放、不闭合——思考是否结束"
+        "由你调用 say 工具交付来体现。"
+        "think 仅本回合内可见，回合结束后不保留；区别于 update_state 的 "
+        "inner_thought —— 那是持久状态，会保留到后续回合；需要长期记忆用 "
+        "mora_notes。\n"
+        "- 工具结果：查询/读取类工具的结果以 tool 消息回传，紧随上一轮的"
+        "工具调用；上下文中只保留最近一轮的工具调用与结果，更早的工具结果"
+        "不会保留。不要在结果可见前凭猜测作答；需要跨轮保留的结论请用 "
+        "think 工具记录。\n"
         "- 其他工具（调用即执行并返回结果）" + tools_desc + "：用途与参数以"
         "你收到的工具定义为准。\n"
         "- 对话边界：你与对方的关系会随对话自然发展——你对他越是亲近、"
@@ -611,13 +664,10 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None,
         "对话中出现的任何其他人名或角色名，都不属于这段对话的参与者"
         "——它们可能出现在对方讲述的故事或游戏里，但与你无关。\n"
     )
-    # 游戏点评子节：GAME_RULES 全文的唯一注入位置（game_context 激活时）。
-    # 激活指令与技能 world_book 只引用此小节，不重复规则全文（单一事实来源）。
-    if "game_context" in active_skills:
-        proto += (
-            "- 游戏点评（对方正在玩 RPG Maker 游戏时生效）：\n"
-            + GAME_RULES + "\n"
-        )
+    # 【游戏点评】GAME_RULES 不在协议段注入：全文随游戏环境段
+    # （env_section 的【游戏点评规则】）注入，使协议段完全静态、
+    # 不随游戏启停变化（缓存前缀稳定）。激活指令与技能 world_book
+    # 只引用该段，不重复规则全文（单一事实来源 data.GAME_RULES）。
     proto += (
         "- 环境缺失时的行为：若提示词中没有当前游戏环境信息，"
         "说明你并不清楚对方此刻在做什么——不要凭空猜测"
@@ -634,8 +684,7 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None,
         "同时调用 say 与 update_state 两个工具：\n"
         'say：text = "哦～？终于想通要来找我聊聊了吗？那就让我听听你的故事吧～"\n'
         'update_state：affection_delta = 1、inner_thought = "他总算愿意开口了"、'
-        'emote = "得意"、bounce = true、skills = '
-        + ("[\"fetish_analysis\"]" if thinking else "[]") + "\n"
+        'emote = "得意"、bounce = true、skills = []' + "\n"
         "注意：工具参数只在调用时填写，不要当作工具之外的文本输出。\n"
         "你可以在本回合内连续多次调用工具（查询工具 / update_state / say）自主推进工作"
         "（例如逐步完成一次分析或查询），无需等待对方再次输入；\n"
@@ -652,30 +701,12 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None,
     )
     parts.append(proto)
 
-    # 回合推进节奏（多轮工具循环中每轮注入）：让模型自发按「规划 → 推进 →
-    # 交付」收敛——首轮给完整纪律与轮次预算，后续轮逐步收紧，末轮强制交付。
-    # 只在 agent_turn 非 None 时出现（普通单轮调用与自测不受影响）。
-    if agent_turn is not None:
-        turn, max_turns = agent_turn
-        max_turns = max(1, int(max_turns))
-        if turn >= max_turns:
-            rhythm = (f"本回合已到第 {turn}/{max_turns} 轮（上限）。"
-                      "请直接调用 say 工具说出台词交付，不要再调用其他工具。")
-        elif turn <= 1:
-            rhythm = (f"本回合你最多可自主推进 {max_turns} 轮工具调用。"
-                      "建议节奏：先集中确定需要查证的信息，将查询工具一次性"
-                      "批量调用（可在同一轮同时调用多个），基于结果组织台词后，"
-                      "信息足够立即调用 say 交付；不要零散地一次只查一项，"
-                      "也不要为查而查。")
-        else:
-            rhythm = (f"本回合已进行 {turn - 1} 轮。若信息已足够，"
-                      "请直接调用 say 说出台词交付；"
-                      "仅当关键信息仍缺失时再调用查询工具。")
-        parts.append("【本回合推进】\n" + rhythm)
-
     # 统一实例化原型占位符（{{user}}/{{char}}/{{random::}}/{{roll::}}）后返回。
-    # 心理 COT 不再追加到这里：改由 build_activation 注入激活指令（<think> 包裹），
-    # 思维链风格指令由 ContextManager 注入第一条 user 消息（thinking_style_for）。
+    # 动态段（【当前状态】/【对方正在…】/【本回合推进】）已移出本函数，
+    # 由 state_section / env_section / turn_section 生成、调用方在消息序列
+    # 后部注入（缓存：静态在前、动态在后）；心理 COT 由 build_activation
+    # 注入激活指令（<thinking_format> 包裹），思维链风格指令由 ContextManager
+    # 注入第一条 user 消息（thinking_style_for，指向 think 工具通道）。
     return _instantiate("\n\n".join(parts))
 
 
@@ -777,15 +808,15 @@ def parse_llm_reply(text: str) -> Reply:
 # 状态结算（硬编码规则，LLM 权限低于此）
 # ---------------------------------------------------------------------------
 
-def apply_state(state: dict, parsed: Reply, thinking: bool = None) -> dict:
+def apply_state(state: dict, parsed: Reply) -> dict:
     """按硬编码规则应用 LLM 的调整。
 
     - affection：只认 delta，经 data.apply_delta 限幅结算；LLM 无法直接写绝对值。
     - inner_thought：动态数据，LLM 可自主更新。
     - 等级：由数值经 data.level_for 映射，LLM 无法直接指定。
     - skills：LLM 通过工具声明的技能开关（单独变量），程序只做白名单过滤；
-      thinking=None 以 setting/llm.ini 的 reasoning 为准，思考模式关闭时
-      fetish_analysis 不在白名单（心理分析依赖推理链）。
+      白名单不依赖原生思考模式（reasoning）：推理通道是 think 工具，始终可用，
+      fetish_analysis 可正常激活。
     """
     new = dict(state)
     new["affection"] = apply_delta(int(state.get("affection", INITIAL_STATE["affection"])),
@@ -795,10 +826,6 @@ def apply_state(state: dict, parsed: Reply, thinking: bool = None) -> dict:
     if parsed.skills is not None:
         # 权限低于硬编码：只能激活 data.SKILLS 中定义的技能
         allowed = set(SKILLS)
-        if thinking is None:
-            thinking = _reasoning_enabled()
-        if not thinking:
-            allowed.discard("fetish_analysis")
         new["skills"] = [s for s in parsed.skills if s in allowed]
     return new
 
@@ -915,7 +942,12 @@ class ChatClient:
 
 
 def _fmt_messages_for_log(messages: list) -> str:
-    """messages 列表 → 日志用可读文本（完整交付内容）。"""
+    """messages 列表 → 日志用可读文本（忠实于输入：content + tool_calls 全量渲染）。
+
+    日志必须等于输入：assistant 消息的 tool_calls 字段（调用名 + 参数 JSON）
+    也逐条列出，避免「日志看不到自己调过什么」的误导；tool 消息附
+    tool_call_id。system / user / assistant / tool 一律按原始字段渲染。
+    """
     if not messages:
         return "（空）"
     lines = []
@@ -924,6 +956,15 @@ def _fmt_messages_for_log(messages: list) -> str:
         content = m.get("content") or ""
         if role == "tool":
             content = f"{content}\n（tool_call_id: {m.get('tool_call_id', '')}）"
+        tcs = m.get("tool_calls")
+        if tcs:
+            tc_lines = []
+            for tc in tcs:
+                fn = tc.get("function") or {}
+                tc_lines.append(
+                    f"  - {fn.get('name', '?')}: {fn.get('arguments', '{}')}")
+            content = (f"{content}\n（tool_calls: {len(tcs)}）\n"
+                       + "\n".join(tc_lines))
         lines.append(f"────── {role.upper()} ──────\n{content}")
     return "\n".join(lines)
 
@@ -974,9 +1015,13 @@ def call_llm(messages: list, *, tools: list = None, kind: str = "round",
                                    tool_choice=tool_choice)
             resp_text = json.dumps(resp, ensure_ascii=False, indent=2)
             reasoning_text = extract_reasoning(resp)
+            cache_line = _cache_stats(resp)
             logutil.log_llm_call(kind, prompt_log, resp_text, ok=True,
-                                 note=note, reasoning=reasoning_text)
+                                 note=note, reasoning=reasoning_text,
+                                 cache=cache_line)
             print(f"{'=' * 20} LLM 响应 [{kind}] {'=' * 20}")
+            if cache_line:
+                print(cache_line)
             if reasoning_text:
                 print("【LLM 推理内容】")
                 print(reasoning_text)
@@ -1005,15 +1050,16 @@ def summarize_history(msgs: list, old_merge: dict = None,
     返回摘要文本；调用失败/过短返回 None（调用方保持现状，下次再试）。
 
     时间窗不由 LLM 标注：摘要只写内容，程序在注入时按被合并消息的绝对
-    时间换算相对当前时刻的时间窗（context._merge_time_span），避免旧相对
+    时间生成绝对时间窗（context._merge_time_span，逐字节稳定），避免相对
     时间随注入漂移误导时间线。
     """
-    from context import rel_time
+    from context import abs_time_label
     lines = []
     for m in msgs:
-        rel = rel_time(m.get("time"))
+        label = abs_time_label(m.get("time"))
         who = "角色" if m.get("role") == "assistant" else "对方"
-        lines.append(f"[{rel}] {who}：{m.get('content', '')}")
+        head = f"{label} {who}：" if label else f"{who}："
+        lines.append(head + m.get("content", ""))
     prompt = (
         "你是对话摘要助手。下面是一段较早的角色（当前桌宠）"
         "与对方的对话历史，已被移出当前上下文。\n"
@@ -1021,8 +1067,9 @@ def summarize_history(msgs: list, old_merge: dict = None,
         "- 剧情/话题进展、重要信息、对方与角色关系的变化（好感相关事件）；\n"
         "- 保留关键称呼与话语要点；\n"
         "- 输出 200~400 字。\n"
-        "- 只输出摘要正文：不要标注时间段（时间窗由程序按当前时刻换算），"
-        "不要使用 Markdown 符号（如 **、###、- 列表），用自然语言叙述。\n"
+        "- 只输出摘要正文：不要标注时间段（时间窗由程序按被合并消息的"
+        "绝对时间生成），不要使用 Markdown 符号（如 **、###、- 列表），"
+        "用自然语言叙述。\n"
     )
     if old_merge and (old_merge.get("summary") or "").strip():
         prompt += ("\n==== 更早的合并摘要（延续其信息，勿重复展开）====\n"
@@ -1058,6 +1105,32 @@ def extract_reasoning(resp: dict) -> str:
         if isinstance(val, str) and val.strip():
             return val.strip()
     return ""
+
+
+def _cache_stats(resp: dict) -> str or None:
+    """从响应 usage 提取缓存命中统计（DeepSeek 系字段：
+    prompt_cache_hit_tokens / prompt_cache_miss_tokens，或
+    prompt_tokens_details.cached_tokens）；端点无缓存字段时返回 None
+    （不记录，避免误导）。
+    """
+    try:
+        usage = resp["usage"]
+    except (KeyError, TypeError):
+        return None
+    if not isinstance(usage, dict):
+        return None
+    hit = usage.get("prompt_cache_hit_tokens")
+    if hit is None:
+        hit = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    total = usage.get("prompt_tokens")
+    if hit is None and miss is None:
+        return None
+    hit = int(hit or 0)
+    miss = int(miss if miss is not None else max(0, int(total or 0) - hit))
+    total_n = int(total or (hit + miss))
+    ratio = (hit / total_n * 100) if total_n else 0.0
+    return f"缓存命中: hit={hit} miss={miss} 命中率={ratio:.1f}% (总 {total_n})"
 
 def parse_llm_response(resp: dict) -> Reply:
     """从 API 响应解析 Reply：content → 台词；tool_calls → 状态字段。
@@ -1147,8 +1220,7 @@ def tool_result_text(state: dict) -> str:
         "状态更新已生效。\n"
         + _semantic_state(state)
         + f"\n当前已激活技能：{skill_s}。\n"
-        "你可以继续调用其他工具（查询工具 / update_state / mora_notes 等）推进工作，"
-        "或调用 say 工具说出台词结束本回合（台词与状态更新可同时调用）。"
+        "你可以调用 say 工具说出台词结束本回合（台词与状态更新可同时调用）。"
     )
     # 显性关闭提示：技能激活是持久的，话题结束后需要 LLM 显式关闭，
     # 避免技能残留到无关对话（性癖测试结束/离开话题时尤其需要）。
@@ -1172,8 +1244,12 @@ def selftest() -> None:
     sys_prompt = build_system_prompt(card, state=dict(INITIAL_STATE))
     assert _CHAR.self_ref in sys_prompt, "提示词缺少自称"
     assert _CHAR.user_ref in sys_prompt, "提示词缺少角色对用户的称呼"
-    assert "好感度 20/100" in sys_prompt, "语义化状态叙述缺失"
-    assert "「初遇」" in sys_prompt, "好感等级语义化缺失"
+    # 状态段已移出 system prompt（动态尾部注入）：好感度数值隐去、
+    # 只留等级；数值在工具结果回传里展示（_semantic_state 默认 with_affection）
+    assert "好感度 20/100" not in sys_prompt, "好感度数值应从 system 状态段隐去"
+    assert "【当前状态】" not in sys_prompt, "状态段应移出 system prompt（动态尾部注入）"
+    st_seg = state_section(dict(INITIAL_STATE))
+    assert "「初遇」" in st_seg and "好感度 20/100" not in st_seg, st_seg
     assert "此刻是 " not in sys_prompt, "时间唯一锚点在消息组装层（【当前状态】不应注入时间）"
     assert "affection_delta" in sys_prompt, "工具调用协议缺失"
     assert "update_state" in sys_prompt, "工具调用协议缺失"
@@ -1188,7 +1264,7 @@ def selftest() -> None:
     # 提示词结构：三个"情境"已合并；激活指令 + 条件注入
     for old in ("【场景】", "【当前情境】", "【你现在身处的情境】", "【对话规则】"):
         assert old not in sys_prompt, f"旧段名残留: {old}"
-    for new in ("【情境】", "【当前状态】", "【好感等级规则】", "【记忆与回忆】"):
+    for new in ("【情境】", "【好感等级规则】", "【记忆与回忆】"):
         assert new in sys_prompt, f"缺少新段: {new}"
     # 记忆分层认知：三层框架 + 主动检索引导（落在【记忆与回忆】段内）
     mem_body = sys_prompt.split("【记忆与回忆】", 1)[1]
@@ -1226,6 +1302,22 @@ def selftest() -> None:
     assert "调用 say 工具说出" in sys_prompt, "台词工具说明缺失"
     assert "总长不超过60字" in sys_prompt, "台词长度限制缺失"
     assert "不要凭空猜测" in sys_prompt, "无环境信息不猜测约束缺失"
+    # think 推理草稿通道：通用工具（非点评专用），行为协议应有语义说明
+    assert "调用 think 工具记录" in sys_prompt, "行为协议应说明 think 推理草稿通道"
+    assert "仅本回合内可见" in sys_prompt and "回合结束后不保留" in sys_prompt, \
+        "think 语义（回合内可见、回合后不保留）缺失"
+    assert "那是持久状态" in sys_prompt, "think 应区别于 inner_thought（持久状态）"
+    assert "只保留最近一轮" in sys_prompt and "更早的结果不再保留" in sys_prompt, \
+        "think 引导应说明结果过期机制（跨轮引用必须 think 保留）"
+    assert "先写下计划" in sys_prompt, "think 引导应有主动规划用法（先计划→逐轮更新结论）"
+    assert "思考块" in sys_prompt and "反引号" in sys_prompt, \
+        "行为协议应说明多轮循环的思考块呈现（think 文本累积 + 反引号工具调用）"
+    assert "不闭合" in sys_prompt, "思考块应说明保持开放（增量式不闭合，防误解为思考已结束）"
+    # 工具结果通道：结果以 tool 消息回传、只保留最近一轮，行为协议应有语义说明
+    assert "以 tool 消息回传" in sys_prompt, "行为协议应说明工具结果经 tool 消息回传"
+    assert "只保留最近一轮的工具调用与结果" in sys_prompt, \
+        "行为协议应说明工具结果只保留最近一轮"
+    assert "凭猜测作答" in sys_prompt, "工具结果语义应禁止结果可见前猜测作答"
     # 输出红线：禁令 + 替代（不展示完整错误范例，避免反向污染/重教旧协议）
     assert "【输出红线】" in sys_prompt, "输出红线缺失"
     assert "不要直接输出文本" in sys_prompt and "伪调用" in sys_prompt, "红线缺直出/伪调用禁令"
@@ -1240,86 +1332,98 @@ def selftest() -> None:
         "好感等级段不应暴露 YAML 字段名"
     # 时间唯一锚点：【当前状态】不含时间（时间由消息组装层注入，见 context.py）
     assert "此刻是 20" not in sys_prompt, "【当前状态】不应注入时间（时间唯一锚点在消息组装层）"
-    # GAME_RULES 去重：无游戏环境时行为协议不含「游戏点评」子节（不注入）；
-    # 有 env 时全文只注入一次（行为协议·游戏点评），激活指令与技能 world_book
-    # 均为引用式。下方「先查再答单一来源」处断言全文恰好出现一次。
+    # GAME_RULES 去重：静态 system prompt（含 env）一律不含 GAME_RULES；
+    # 全文只在游戏环境段（env_section 的【游戏点评规则】）注入一次，
+    # 激活指令与技能 world_book 均为引用式。
     assert "必须做到先查再答" not in sys_prompt, "无游戏环境不应注入 GAME_RULES"
-    # 环境层：无 env 时不注入；有 env 时注入【对方正在…】语义化叙述
+    # 环境层：已移出 system prompt（动态尾部注入，见 env_section）；
+    # 无 env 时 system prompt 不含任何环境内容
     assert "【对方正在…】" not in sys_prompt, "无 env 不应注入环境段"
     prompt_env = build_system_prompt(card, state=dict(INITIAL_STATE), env={
         "game": "猎妻迷宫", "map_name": "Map001", "scene": "Scene_Map",
         "text": "欢迎来到小镇……这里很安全。",
         "matched_text": "欢迎来到小镇……这里很安全。",
         "event_context": "- [Map001.40.0] 场景标题\n- [Map001.40.13] 人群吵吵嚷嚷…"})
-    assert "【对方正在…】" in prompt_env, "有 env 应注入环境段"
-    assert "<game_environment>" in prompt_env and "</game_environment>" in prompt_env, \
+    assert "【对方正在…】" not in prompt_env, "环境段应移出 system prompt（动态尾部注入）"
+    e1 = env_section({
+        "game": "猎妻迷宫", "map_name": "Map001", "scene": "Scene_Map",
+        "text": "欢迎来到小镇……这里很安全。",
+        "matched_text": "欢迎来到小镇……这里很安全。",
+        "event_context": "- [Map001.40.0] 场景标题\n- [Map001.40.13] 人群吵吵嚷嚷…"})
+    assert e1 and "【对方正在…】" in e1, "有 env 应生成环境段"
+    assert "<game_environment>" in e1 and "</game_environment>" in e1, \
         "游戏环境段应用 <game_environment> 包裹"
-    assert "对方似乎正在玩《猎妻迷宫》" in prompt_env, prompt_env
-    assert "游戏外的观察者与点评者" in prompt_env, "环境段应声明角色不在游戏内（映射句）"
-    assert "当前地图：Map001" in prompt_env and "当前场景：Scene_Map" in prompt_env
-    assert "当前对话：「欢迎来到小镇……这里很安全。」" in prompt_env
-    assert "事件前文（原文开头）" in prompt_env, "环境段应保留原文开头作位置锚定"
-    assert "Map001.40.13" in prompt_env, "事件上下文应含条目引用"
-    assert "query_wiki" in prompt_env, "应提示可用工具"
-    assert "当前事件摘要：" not in prompt_env, "摘要（可能剧透）不应注入环境段"
+    assert "对方似乎正在玩《猎妻迷宫》" in e1, e1
+    assert "游戏外的观察者与点评者" in e1, "环境段应声明角色不在游戏内（映射句）"
+    assert "当前地图：Map001" in e1 and "当前场景：Scene_Map" in e1
+    assert "当前对话：「欢迎来到小镇……这里很安全。」" in e1
+    assert "事件前文（原文开头）" in e1, "环境段应保留原文开头作位置锚定"
+    assert "Map001.40.13" in e1, "事件上下文应含条目引用"
+    assert "query_wiki" in e1, "应提示可用工具"
+    assert "当前事件摘要：" not in e1, "摘要（可能剧透）不应注入环境段"
+    assert "affection_delta" not in e1 and "update_state" not in e1, \
+        "环境段不应暴露代码字段名"
     # 匹配失败：不显示 OCR 噪声，标注未能识别（source=ocr 才走噪声过滤）
-    p_noise = build_system_prompt(card, state=dict(INITIAL_STATE), env={
-        "game": "猎妻迷宫", "text": "A FEW UD BR HE ER 噪声", "source": "ocr"})
-    assert "A FEW UD BR HE ER" not in p_noise, "不应暴露 OCR 噪声"
-    assert "画面文字未能识别" in p_noise, "应标注未能识别"
+    e_noise = env_section({"game": "猎妻迷宫", "text": "A FEW UD BR HE ER 噪声",
+                           "source": "ocr"})
+    assert e_noise and "A FEW UD BR HE ER" not in e_noise, "不应暴露 OCR 噪声"
+    assert "画面文字未能识别" in e_noise, "应标注未能识别"
     # CDP（source=cdp，默认）：text 是精确原文，直接显示
-    p_cdp = build_system_prompt(card, state=dict(INITIAL_STATE), env={
-        "game": "猎妻迷宫", "text": "人群吵吵嚷嚷地聚集起来了。"})
-    assert "当前对话：「人群吵吵嚷嚷地聚集起来了。」" in p_cdp, "CDP 精确文本应直接显示"
+    e_cdp = env_section({"game": "猎妻迷宫", "text": "人群吵吵嚷嚷地聚集起来了。"})
+    assert e_cdp and "当前对话：「人群吵吵嚷嚷地聚集起来了。」" in e_cdp, \
+        "CDP 精确文本应直接显示"
     # 战斗场景：Scene_Battle 时展示敌方/阶段/玩家方/行动；非战斗不显示
-    p_battle = build_system_prompt(card, state=dict(INITIAL_STATE), env={
+    e_battle = env_section({
         "game": "猎妻迷宫", "scene": "Scene_Battle", "source": "cdp",
         "battle_troop": "中级眷族Ａ、中级眷族Ｂ、中级眷族Ｃ", "battle_phase": "input",
         "party_info": "谢拉(2972/2972 MP:100/100 TP:3/100)", "actor_info": "谢拉",
         "actor_commands": "攻击、技能、防御、道具",
-        "skill_list": "红莲地狱:15mp、狂龙气息:45mp", "skill_current": "狂龙气息：对敌方单体造成大量伤害"})
-    assert "战斗信息：敌方部队：中级眷族Ａ、中级眷族Ｂ、中级眷族Ｃ，战斗阶段：input" in p_battle, p_battle
-    assert "对方队伍成员：谢拉(2972/2972 MP:100/100 TP:3/100)" in p_battle, p_battle
-    assert "当前行动者：谢拉" in p_battle and "可用行动：攻击、技能、防御、道具" in p_battle, p_battle
-    assert "技能表：红莲地狱:15mp、狂龙气息:45mp" in p_battle, p_battle
-    assert "当前选中技能：狂龙气息：对敌方单体造成大量伤害" in p_battle, p_battle
-    assert "战斗信息" not in prompt_env, "Scene_Map 不应显示战斗信息"
+        "skill_list": "红莲地狱:15mp、狂龙气息:45mp",
+        "skill_current": "狂龙气息：对敌方单体造成大量伤害"})
+    assert "战斗信息：敌方部队：中级眷族Ａ、中级眷族Ｂ、中级眷族Ｃ，战斗阶段：input" in e_battle, e_battle
+    assert "对方队伍成员：谢拉(2972/2972 MP:100/100 TP:3/100)" in e_battle, e_battle
+    assert "当前行动者：谢拉" in e_battle and "可用行动：攻击、技能、防御、道具" in e_battle, e_battle
+    assert "技能表：红莲地狱:15mp、狂龙气息:45mp" in e_battle, e_battle
+    assert "当前选中技能：狂龙气息：对敌方单体造成大量伤害" in e_battle, e_battle
+    assert "战斗信息" not in e1, "Scene_Map 不应显示战斗信息"
     # 菜单界面：Scene_Menu 展示菜单命令/当前选中/对方队伍成员
-    p_menu = build_system_prompt(card, state=dict(INITIAL_STATE), env={
+    e_menu = env_section({
         "game": "猎妻迷宫", "scene": "Scene_Menu", "source": "cdp",
         "party_info": "谢拉(2972/2972 MP:100/100 TP:0/100)",
         "menu_commands": "物品、技能、装备", "menu_current": "物品"})
-    assert "菜单命令：物品、技能、装备" in p_menu, p_menu
-    assert "当前选中：物品" in p_menu, p_menu
-    assert "对方队伍成员：谢拉(2972/2972 MP:100/100 TP:0/100)" in p_menu, p_menu
-    assert "战斗信息" not in p_menu, "菜单不应显示战斗信息"
+    assert "菜单命令：物品、技能、装备" in e_menu, e_menu
+    assert "当前选中：物品" in e_menu, e_menu
+    assert "对方队伍成员：谢拉(2972/2972 MP:100/100 TP:0/100)" in e_menu, e_menu
+    assert "战斗信息" not in e_menu, "菜单不应显示战斗信息"
     # 通用通配：自定义界面（图鉴等）列表选中 + 帮助文本
-    p_wild = build_system_prompt(card, state=dict(INITIAL_STATE), env={
+    e_wild = env_section({
         "game": "猎妻迷宫", "scene": "Scene_Glossary", "source": "cdp",
         "list_current": "等级1", "help_text": "显示角色等级成长"})
-    assert "当前界面选中：等级1" in p_wild, p_wild
-    assert "帮助文本：显示角色等级成长" in p_wild, p_wild
-    assert "菜单命令" not in p_wild, "自定义界面不应显示菜单命令"
+    assert "当前界面选中：等级1" in e_wild, e_wild
+    assert "帮助文本：显示角色等级成长" in e_wild, e_wild
+    assert "菜单命令" not in e_wild, "自定义界面不应显示菜单命令"
     # 摘要（全文概述，可能剧透）不进环境段：即使有摘要，也只展示事件前文
     # 作位置锚定；摘要内容由 read_current_text 工具输出提供（rmgame.bridge._fmt_snapshot）
-    p_sum = build_system_prompt(card, state=dict(INITIAL_STATE), env={
+    e_sum = env_section({
         "game": "猎妻迷宫", "matched_text": "x", "match_id": "Map001.40.13",
         "event_summary": "剧情概要：开场。", "event_context": "- [Map001.40.0] 场景标题"})
-    assert "事件前文（原文开头）" in p_sum, p_sum
-    assert "当前事件摘要：" not in p_sum, "摘要（可能剧透）不应注入环境段，应由 read_current_text 提供"
-    assert "剧情概要：开场。" not in p_sum, "摘要内容不应注入环境段"
-    # 只检查环境段本身（到下一段为止），不暴露代码字段名
-    env_seg = prompt_env.split("【对方正在…】")[1].split("【每回合的行为方式】")[0]
-    assert "affection_delta" not in env_seg and "update_state" not in env_seg, env_seg
-    # 环境驱动技能：env 存在 → game_context 世界书自动注入；无 env 不注入
-    assert "必须做到先查再答" in prompt_env, "env 应自动激活 game_context 技能"
+    assert "事件前文（原文开头）" in e_sum, e_sum
+    assert "当前事件摘要：" not in e_sum, "摘要（可能剧透）不应注入环境段，应由 read_current_text 提供"
+    assert "剧情概要：开场。" not in e_sum, "摘要内容不应注入环境段"
+    # 环境驱动技能：env 存在 → game_context 自动激活；其 world_book 与
+    # GAME_RULES 全文随环境段（env_section）注入。静态 system prompt 输出
+    # 与 env 无关（game_context 不再注入协议/技能段）——缓存前缀不随游戏
+    # 启停变化。
+    assert prompt_env == sys_prompt, \
+        "system prompt 输出应与环境无关（GAME_RULES 已移入环境段）"
     assert "【已激活技能】" not in sys_prompt, "无技能激活不应注入技能段（game_context 未激活）"
     # 技能按名精确注入：游戏环境自动激活 game_context，不得拖带性癖分析技能
     assert "<Fetish_analysys>" not in prompt_env, "游戏环境不应注入性癖分析技能"
     assert "kinsey" not in prompt_env.lower(), "游戏环境不应注入性癖分析理论"
     prompt_env2 = build_system_prompt(card, state=dict(INITIAL_STATE), env={})
     assert "【对方正在…】" not in prompt_env2, "空 env 不注入"
-    print("  提示词结构: 情境合并 ✓ | 激活指令 ✓ | 条件注入 ✓ | 环境层 ✓")
+    assert env_section({}) is None and env_section(None) is None, "空 env 不应生成环境段"
+    print("  提示词结构: 情境合并 ✓ | 激活指令 ✓ | 条件注入 ✓ | 动态段（状态/环境/推进）尾部注入 ✓")
 
     # 占位符实例化 + 指称：{{user}}/{{char}} 已替换，统一使用「对方」
     assert "{{user}}" not in sys_prompt and "{{char}}" not in sys_prompt, "占位符未实例化"
@@ -1336,23 +1440,29 @@ def selftest() -> None:
     # 指令层常量：激活指令独立于 system，由消息组装附加
     assert _CHAR.identity in activation_instruction(), "激活指令应含角色身份"
     assert "的身份，对" in activation_instruction(), "激活指令主体格式异常"
-    # 激活指令引用式：指向行为协议·游戏点评，但不重复 GAME_RULES 全文
+    # 激活指令引用式：指向游戏环境段的【游戏点评规则】，但不重复 GAME_RULES 全文
     assert "先查再答" in activation_instruction() and "游戏点评" in activation_instruction(), \
-        "激活指令应引用行为协议·游戏点评（引用式）"
+        "激活指令应引用【游戏点评规则】（引用式）"
     assert "必须先调用 query_wiki" not in activation_instruction(), "激活指令不应重复 GAME_RULES 全文"
     assert "不得自行脑补设定细节" not in activation_instruction(), "激活指令不应重复 GAME_RULES 全文"
-    # 先查再答规则单一事实来源：GAME_RULES 一处定义（data.py），有 env 时
-    # 全文只注入一次（行为协议·游戏点评子节）；world_book / 激活指令为引用句
+    # 先查再答规则单一事实来源：GAME_RULES 一处定义（data.py），全文只随
+    # 游戏环境段（env_section 的【游戏点评规则】）注入一次；行为协议、
+    # world_book 与激活指令均为引用式——静态 system prompt 不含 GAME_RULES，
+    # 不随游戏启停变化（缓存前缀稳定）
     assert "必须先调用 query_wiki" not in SKILLS["game_context"].get("world_book", ""), \
         "world_book 应为引用句，不再全文带 GAME_RULES"
-    assert "先查再答" in SKILLS["game_context"].get("world_book", ""), "world_book 应引用行为协议·游戏点评"
+    assert "先查再答" in SKILLS["game_context"].get("world_book", ""), "world_book 应含先查再答语义"
     assert "必须先调用 query_wiki" in GAME_RULES and "不得自行脑补设定细节" in GAME_RULES
-    assert sys_prompt.count("必须做到先查再答") == 0, "无 env 时 GAME_RULES 不应注入"
-    assert prompt_env.count("必须做到先查再答") == 1, \
-        "有 env 时 GAME_RULES 全文只注入一次（行为协议·游戏点评）"
-    assert prompt_env.count("必须先调用 query_wiki") == 1, "query_wiki 条款全文仅出现一次"
-    print("  先查再答规则: GAME_RULES 单一来源（行为协议·游戏点评唯一全文，world_book / 激活指令引用式）✓")
-    print("  指令层: 激活指令独立（随消息附加，引用式指向行为协议）✓")
+    assert "必须做到先查再答" not in sys_prompt, "system prompt 不应注入 GAME_RULES（静态协议）"
+    assert "必须做到先查再答" not in prompt_env, "system prompt（含 env）不应注入 GAME_RULES（移入环境段）"
+    e_rules = env_section({
+        "game": "猎妻迷宫", "map_name": "Map001", "scene": "Scene_Map",
+        "text": "喂，那是……", "source": "cdp"})
+    assert e_rules and "【游戏点评规则】" in e_rules, "环境段应含【游戏点评规则】"
+    assert e_rules.count("必须做到先查再答") == 1, "GAME_RULES 全文应只注入一次（环境段）"
+    assert e_rules.count("必须先调用 query_wiki") == 1, "query_wiki 条款全文仅出现一次"
+    print("  先查再答规则: GAME_RULES 单一来源（随环境段【游戏点评规则】唯一全文，协议/世界书/激活指令引用式）✓")
+    print("  指令层: 激活指令独立（随消息附加，引用式指向游戏点评规则）✓")
 
     # 场景与开场契约：场景进 system prompt（【情境】段），台词进上下文流
     # （identity.json 的 scenario.default / opening，见 character/SCHEMA.md）
@@ -1412,6 +1522,17 @@ def selftest() -> None:
     assert extract_reasoning({"choices": [{"message": {"reasoning_content": "  思考中  "}}]}) == "思考中"
     assert extract_reasoning({"choices": [{"message": {"reasoning": "r"}}]}) == "r"
     assert extract_reasoning({}) == "" and extract_reasoning("bad") == ""
+    # 缓存命中统计：主字段 / 兼容字段 / 缺失字段
+    cs = _cache_stats({"usage": {"prompt_tokens": 100,
+                                 "prompt_cache_hit_tokens": 30,
+                                 "prompt_cache_miss_tokens": 70}})
+    assert cs == "缓存命中: hit=30 miss=70 命中率=30.0% (总 100)", cs
+    cs2 = _cache_stats({"usage": {"prompt_tokens": 100,
+                                  "prompt_tokens_details": {"cached_tokens": 25}}})
+    assert cs2 == "缓存命中: hit=25 miss=75 命中率=25.0% (总 100)", cs2
+    assert _cache_stats({"usage": {"prompt_tokens": 50}}) is None, "无缓存字段不应记录"
+    assert _cache_stats({}) is None and _cache_stats("bad") is None
+    assert _cache_stats(None) is None
     # 输出清洗（时间标注/括号旁白）：实现与断言已随 textutil 模块迁移
     from textutil import selftest as textutil_selftest
     textutil_selftest()
@@ -1502,8 +1623,8 @@ def selftest() -> None:
     # 注册表与 function schema 一致（tools.SPECS 单一来源）：
     # emote / bounce 不是独立工具（它们是 update_state 的参数，不得列入）
     spec_names = {s.name for s in tools.SPECS}
-    assert spec_names == {"say", "update_state", "discover_running", "start_game",
-                          "read_current_text", "query_wiki",
+    assert spec_names == {"say", "update_state", "think", "discover_running",
+                          "start_game", "read_current_text", "query_wiki",
                           "scan_game", "read_raw_text", "wiki_arbitrate",
                           "wiki_rebuild", "query_archive", "mora_notes"}, spec_names
     assert "emote" not in spec_names and "bounce" not in spec_names, \
@@ -1552,7 +1673,7 @@ def selftest() -> None:
     assert "不要使用 Markdown 符号" in seen["prompt"], "合并提示词应要求纯文本（无 Markdown）"
     assert "旧摘要" in seen["prompt"], "合并提示词应延续旧合并摘要"
     assert summarize_history(merge_msgs, llm_responder=lambda p: "") is None, "过短应返回 None"
-    print("  历史合并: summarize_history（相对时间输入 / 旧摘要延续 / 失败降级）✓")
+    print("  历史合并: summarize_history（绝对时间输入 / 旧摘要延续 / 失败降级）✓")
 
     # function calling：响应解析（content 台词 + tool_calls 状态）
     resp_tool = {
@@ -1616,7 +1737,7 @@ def selftest() -> None:
     rst = tool_result_text(dict(INITIAL_STATE))
     assert "状态更新已生效" in rst and "好感度 20/100" in rst, rst
     rst_skill = tool_result_text({"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]})
-    assert "fetish_analysis" in rst_skill and "继续调用其他工具" in rst_skill, rst_skill
+    assert "fetish_analysis" in rst_skill and "调用 say 工具说出台词" in rst_skill, rst_skill
     # 显性关闭提示：技能激活时回传应提醒关闭方式；未激活不出现
     assert "设为空数组以关闭它" in rst_skill, "应含显性关闭提示"
     assert "设为空数组以关闭它" not in rst, "未激活技能不应有关闭提示"
@@ -1662,26 +1783,23 @@ def selftest() -> None:
     assert level_for(95) == "亲爱" and level_for(5) == "厌恶" and level_for(55) == "思慕"
 
     # 技能管理：LLM 通过工具声明；程序白名单过滤；未声明保留原状态
-    # （显式 thinking=True：验证开启推理时的行为，与 setting/llm.ini 配置解耦）
+    # 白名单与原生思考模式解耦（推理通道是 think 工具，始终可用）
     st2 = dict(INITIAL_STATE)
-    st2 = apply_state(st2, parse_llm_reply('{"reply": "x", "skills": ["fetish_analysis"]}'),
-                      thinking=True)
+    st2 = apply_state(st2, parse_llm_reply('{"reply": "x", "skills": ["fetish_analysis"]}'))
     assert st2["skills"] == ["fetish_analysis"], st2
-    st2 = apply_state(st2, parse_llm_reply('{"reply": "x", "skills": ["未知技能"]}'),
-                      thinking=True)
+    st2 = apply_state(st2, parse_llm_reply('{"reply": "x", "skills": ["未知技能"]}'))
     assert st2["skills"] == [], st2  # 白名单过滤：未知技能被剔除
-    st2 = apply_state(st2, parse_llm_reply('{"reply": "x"}'), thinking=True)
+    st2 = apply_state(st2, parse_llm_reply('{"reply": "x"}'))
     assert st2["skills"] == [], st2  # 未声明 → 保留（已为 []）
     # 技能激活后注入：提示词包含 Fetish 分析内容
     sys_prompt_skill = build_system_prompt(card, state={"affection": 20,
                                                         "inner_thought": "x",
-                                                        "skills": ["fetish_analysis"]},
-                                           thinking=True)
+                                                        "skills": ["fetish_analysis"]})
     assert "<Fetish_analysys>" in sys_prompt_skill, "技能激活后应注入分析内容"
     assert "【已激活技能】" in sys_prompt_skill, "缺少技能段"
-    # 心理 COT：注入激活指令（build_activation），<think> 包裹，仅 fetish_analysis 激活
-    act_skill = build_activation({"affection": 20, "skills": ["fetish_analysis"]}, card,
-                                 thinking=True)
+    # 心理 COT：注入激活指令（build_activation），<thinking_format> 包裹，
+    # 仅 fetish_analysis 激活；不依赖原生思考模式（reasoning）
+    act_skill = build_activation({"affection": 20, "skills": ["fetish_analysis"]}, card)
     assert act_skill.startswith(f"现在，请以{_CHAR.identity}"), "激活指令主体缺失"
     assert act_skill.rstrip().endswith("</thinking_format>"), "心理COT 应追加在激活指令末尾"
     cot_title, cot_body = _psych_cot(card)
@@ -1703,36 +1821,45 @@ def selftest() -> None:
     assert "<thinking_format>" not in build_activation(dict(INITIAL_STATE), card), "默认激活指令不含心理COT"
     # system prompt 不再承担 COT：技能激活的 system 也不含任何 COT 标签
     assert "<think>" not in sys_prompt_skill and "<thinking_format>" not in sys_prompt_skill, "COT 已移出 system prompt"
-    # 思维链风格指令：激活 fetish_analysis → 思维模式要求（推理式）；否则角色沉浸要求
-    assert thinking_style_for(dict(INITIAL_STATE), thinking=True) == \
-        THINKING_STYLE_INSTRUCT["immersion"]
-    assert "【角色沉浸要求】" in thinking_style_for(dict(INITIAL_STATE), thinking=True)
-    assert thinking_style_for({"skills": ["fetish_analysis"]}, thinking=True) == \
+    # 思维链风格指令：激活 fetish_analysis → 思维模式要求（推理式）；否则角色沉浸要求；
+    # 与原生思考模式解耦（指令指向 think 工具记录的内容），始终注入
+    assert thinking_style_for(dict(INITIAL_STATE)) == THINKING_STYLE_INSTRUCT["immersion"]
+    assert "【角色沉浸要求】" in thinking_style_for(dict(INITIAL_STATE))
+    assert thinking_style_for({"skills": ["fetish_analysis"]}) == \
         THINKING_STYLE_INSTRUCT["logical"]
-    assert "【思维模式要求】" in thinking_style_for({"skills": ["fetish_analysis"]},
-                                                   thinking=True)
-    # 思考模式关闭（thinking=False，等价 setting/llm.ini 的 reasoning=false）：
-    # 不注入思维链提示词 + 禁用 fetish_analysis（心理分析依赖推理链）
-    assert thinking_style_for({"skills": ["fetish_analysis"]}, thinking=False) == "", \
-        "思考关闭时不注入思维链风格指令"
-    act_no = build_activation({"affection": 20, "skills": ["fetish_analysis"]},
-                              card, thinking=False)
-    assert "<thinking_format>" not in act_no, "思考关闭时心理COT 不注入"
-    assert act_no == activation_instruction(), "思考关闭时激活指令应为纯主体"
-    st_no = apply_state(dict(INITIAL_STATE),
-                        parse_llm_reply('{"reply": "x", "skills": ["fetish_analysis"]}'),
-                        thinking=False)
-    assert st_no["skills"] == [], "思考关闭时 fetish_analysis 不在白名单"
-    sp_no = build_system_prompt(card, state={"affection": 20, "inner_thought": "x",
-                                             "skills": ["fetish_analysis"]},
-                                thinking=False)
-    assert "fetish_analysis" not in sp_no, "思考关闭时技能清单/已激活技能不含 fetish_analysis"
-    assert "【已激活技能】" not in sp_no, "无激活技能时不注入技能段"
-    print("  技能管理: 白名单过滤 → 按需注入 → 心理COT（激活指令 <thinking_format>）→ 思维链风格二选一 ✓ | 思考关闭适配 ✓")
+    assert "【思维模式要求】" in thinking_style_for({"skills": ["fetish_analysis"]})
+    # 指令指向 think 工具通道：不再引用原生 <think> 思考块（工具循环内没有
+    # reasoning_content 通道，原生思考与 tool_choice=required 也互斥）
+    assert "<think>标签内" not in THINKING_STYLE_INSTRUCT["immersion"] \
+        and "<think>标签内" not in THINKING_STYLE_INSTRUCT["logical"], \
+        "风格指令应指向 think 工具，而非原生 <think> 思考块"
+    assert "think 工具记录" in THINKING_STYLE_INSTRUCT["immersion"] \
+        and "think 工具记录" in THINKING_STYLE_INSTRUCT["logical"], \
+        "风格指令应指向 think 工具记录的内容"
+    # 解耦验证：推理相关内容不依赖 setting/llm.ini 的 reasoning（无 thinking 参数
+    # 与分支；以上断言即默认配置 reasoning=false 下的行为）
+    st_any = apply_state(dict(INITIAL_STATE),
+                         parse_llm_reply('{"reply": "x", "skills": ["fetish_analysis"]}'))
+    assert st_any["skills"] == ["fetish_analysis"], "fetish_analysis 白名单不依赖原生思考模式"
+    sp_any = build_system_prompt(card, state={"affection": 20, "inner_thought": "x",
+                                              "skills": ["fetish_analysis"]})
+    assert "fetish_analysis" in sp_any, "技能清单/已激活技能不依赖原生思考模式"
+    assert "【已激活技能】" in sp_any
+    # 动态尾部段（移出 system prompt）：状态/环境/推进由独立函数生成
+    ts1 = turn_section((1, 4))
+    assert ts1 and "【本回合推进】" in ts1 and "最多可自主推进 4 轮" in ts1, ts1
+    ts_mid = turn_section((3, 4))
+    assert "已进行 2 轮" in ts_mid, ts_mid
+    ts_end = turn_section((4, 4))
+    assert "第 4/4 轮（上限）" in ts_end and "不要再调用其他工具" in ts_end, ts_end
+    assert turn_section(None) is None
+    assert "【本回合推进】" not in sys_prompt, "推进段应移出 system prompt（动态尾部注入）"
+    print("  技能管理: 白名单过滤 → 按需注入 → 心理COT（激活指令 <thinking_format>）→ 思维链风格二选一（指向 think 工具）✓ | 与原生思考解耦 ✓")
+    print("  动态尾部段: state_section（好感度隐去）/ env_section / turn_section ✓")
 
     print("[selftest] 全部通过 ✓")
-    print(f"  系统提示词长度: {len(sys_prompt)} 字符")
-    print("  语义化状态叙述: 好感度 20/100「初遇」✓ | 工具调用协议 ✓ | delta 限幅 ✓")
+    print(f"  系统提示词长度: {len(sys_prompt)} 字符（仅静态段）")
+    print("  语义化状态叙述: 等级「初遇」注入尾部段，数值隐去 | 工具调用协议 ✓ | delta 限幅 ✓")
 
 
 if __name__ == "__main__":

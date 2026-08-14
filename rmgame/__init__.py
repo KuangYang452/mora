@@ -1,8 +1,8 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """rmgame —— RPG Maker 游戏文本点评工具（角色侧扩展）
 
 M0 范围：游戏发现（discovery）+ 文本提取（extract）。
-设计文档：RPG_MAKER_TOOL.md（根目录）。
+设计文档：docs/RPG_MAKER_TOOL.md（内部文档，不入库）。
 
 职责分层：
 - discovery.py  扫描硬盘 → 游戏库注册（runtime/games.json）

@@ -29,7 +29,7 @@ CURRENT_FILE = RUNTIME_DIR / "current.json"
 
 # 端口段：按 slug 哈希在 10240-60239 固定分配（跨进程稳定）。
 # 1.0 起扩大端口空间（原 9222-9321 固定 100 端口易被"扫端口即得"命中，
-# 见 1.0_RELEASE_PLAN.md §5.1 T1 加固项 3）。
+# 见 docs/1.0_RELEASE_PLAN.md §5.1 T1 加固项 3）。
 PORT_BASE = 10240
 PORT_SPAN = 50000
 

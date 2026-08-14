@@ -12,7 +12,7 @@
   merged_summary + 被合并的原始消息，供 query_archive 工具查询；
   merged_summary 为新增字段，旧存档缺失时查询端回退 summary）；
 - 存档标注 saved_at；每条消息带 time（ISO 时间戳，由 context 写入），
-  发往 LLM 的 messages 会剥离 time 并转为相对时间标注；
+  发往 LLM 的 messages 会剥离 time 并转为绝对时间标注；
 - 写盘用临时文件 + rename（原子写），失败不抛异常；
 - 存档缺失/损坏时加载返回 None，调用方回退初始状态与开场白。
 """

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """工具注册表 —— tools
 
-全部 LLM 工具的唯一注册处（1.0 起，见 1.0_RELEASE_PLAN.md §5.4）：
+全部 LLM 工具的唯一注册处（1.0 起，见 docs/1.0_RELEASE_PLAN.md §5.4）：
 - ToolSpec 聚合：工具名 / 语义化描述 / 原生 function schema / 分类标记
   （is_query 查询类 → 意向-动作校验；is_game_world 游戏世界类 →
   <game_data> 包裹）/ rmgame 标记（受 CONFIG["rmgame_enabled"] 开关）。
@@ -88,6 +88,28 @@ SPECS: list = [
                                    "game_context 在游戏环境下自动激活，无需声明"},
             },
             ["affection_delta"]),
+    ),
+    # ---- 推理草稿（通用推理增强通道）----
+    # DeepSeek API 工具调用与思维链互斥：工具循环内没有 reasoning_content 通道，
+    # think 是本回合内的推理通道 —— 内容仅回合内可见（agent_msgs），回合结束
+    # 随 agent_msgs 一并丢弃，不进入 ctx.history（通用工具，不限于点评模块）。
+    ToolSpec(
+        name="think",
+        desc="推理草稿：多轮工具推进时的分析计划与跨轮结论（回合结束不保留）",
+        description=(
+            "多轮工具调用中保存分析结论的通道：查询/工具结果只保留最近一轮"
+            "（更早的结果不再保留），需要跨轮引用的结论必须经本工具保留。"
+            "用法：开始多轮推进前，先写下分析计划或待验证的假设；每轮调用"
+            "得出关键结论后，更新本工具的结论要点（覆盖式，只留最新）；"
+            "后续轮次直接引用，不必重新查询。"
+            "本工具内容仅本回合内可见，回合结束后不保留；"
+            "只写结论要点（不超过 200 字），不要写完整推理过程或内心独白。"
+            "需要长期保留的内容请用 update_state 的 inner_thought（持久状态）"
+            "或 mora_notes（长期记忆），不要写进本工具。"),
+        schema=_params(
+            {"content": {"type": "string",
+                         "description": "本回合思考结论要点（≤200 字，供后续轮次引用）"}},
+            ["content"]),
     ),
     # ---- RPG Maker 点评工具（rmgame/bridge 执行体，开关 rmgame_enabled）----
     ToolSpec(
@@ -297,7 +319,14 @@ def selftest() -> None:
     assert len(off) == len(on) - 8, "rmgame 关闭时应剔除 8 个工具"
     assert "say" not in prompt_names(), "say 不列入提示词清单"
     assert query_names() <= game_world_names(), "查询类工具应属游戏世界类（<game_data> 包裹）"
-    print(f"  tools 注册表: {len(SPECS)} 个工具（rmgame 8 + 内建/归档/笔记）"
+    # think 通用推理通道：非 rmgame（开关过滤不剔除）、非查询、非游戏世界
+    assert "think" in {s.name for s in on} and "think" in {s.name for s in off}, \
+        "think 不应受 rmgame 开关影响"
+    assert "think" not in query_names() and "think" not in game_world_names(), \
+        "think 既非查询类也非游戏世界类"
+    th = by_name("think")
+    assert th and th.schema.get("required") == ["content"], "think 应要求 content 参数"
+    print(f"  tools 注册表: {len(SPECS)} 个工具（rmgame 8 + 内建/归档/笔记/think）"
           f" | 查询类 {len(query_names())} | 游戏世界类 {len(game_world_names())} ✓")
 
 

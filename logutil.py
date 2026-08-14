@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """日志工具 —— 桌宠角色
 
 职责：
@@ -44,14 +44,18 @@ def _fmt_dict_state(state: dict) -> str:
 
 
 def _fmt_messages(messages: list) -> str:
-    """messages 列表 → 分段可读文本（system 即最终交付的提示词）。"""
+    """messages 列表 → 分段可读文本（忠实于输入：system 即最终交付的提示词）。
+
+    tool 角色消息带标题与 tool_call_id，与 llm._fmt_messages_for_log 一致，
+    保证日志所见即模型所收。
+    """
     if not messages:
         return "（空）"
     lines = []
     sys_seen = False
     for m in messages:
         role = m.get("role", "?")
-        content = m.get("content", "")
+        content = m.get("content") or ""
         if role == "system":
             title = ("SYSTEM（最终交付给 LLM 的提示词）" if not sys_seen
                      else "SYSTEM（附加指令：示例/激活）")
@@ -61,6 +65,9 @@ def _fmt_messages(messages: list) -> str:
             lines.append("────── USER ──────")
         elif role == "assistant":
             lines.append("────── ASSISTANT（此前回合）──────")
+        elif role == "tool":
+            content = f"{content}\n（tool_call_id: {m.get('tool_call_id', '')}）"
+            lines.append("────── TOOL ──────")
         lines.append(content)
     return "\n".join(lines)
 
@@ -105,11 +112,13 @@ MAX_LLM_LOGS = 50            # 通用 LLM 调用日志保留条数（llm_*.txt�
 
 def log_llm_call(kind: str, prompt: str, response: str,
                  ok: bool = True, note: str = "",
-                 reasoning: str = "") -> None:
+                 reasoning: str = "", cache: str = "") -> None:
     """写一条通用 LLM 调用日志。
 
     kind：'round' | 'merge' | 'summary' | 'wiki_discovery' | 'wiki_rewrite' 等。
     记录完整交付消息与原始响应（含成功/失败标记），滚动保留 MAX_LLM_LOGS 条。
+    cache：缓存命中统计行（llm._cache_stats 生成，如「缓存命中: hit=1536
+    miss=5662 命中率=21.3% (总 7198)」），空串不记录。
     由 llm.call_llm 统一调用——所有 LLM 调用经此接口即自动留痕。
     """
     if not is_enabled():
@@ -120,7 +129,8 @@ def log_llm_call(kind: str, prompt: str, response: str,
     head = (f"【LLM 调用日志】kind={kind} | ok={'✓' if ok else '✗'}\n"
             f"note: {note}\n"
             f"time: {now.isoformat(timespec='seconds')}\n"
-            "----------------------------------------\n"
+            + (f"cache: {cache}\n" if cache else "")
+            + "----------------------------------------\n"
             "【交付给 LLM 的消息】\n")
     try:
         (LOG_DIR / fname).write_text(
@@ -148,6 +158,35 @@ def _prune_llm_logs() -> None:
         pass
 
 
+def _cache_line(raw_reply) -> str:
+    """从响应 dict 的 usage 提取缓存命中统计一行（与 llm._cache_stats 同字段）。
+
+    端点无缓存字段返回空串（不记录）。logutil 为 llm 依赖的叶子模块，
+    为避免循环导入不做顶层 import，此处按相同字段自行提取（与 reasoning
+    提取同样的处理方式）。
+    """
+    if not isinstance(raw_reply, dict):
+        return ""
+    try:
+        usage = raw_reply["usage"]
+    except (KeyError, TypeError):
+        return ""
+    if not isinstance(usage, dict):
+        return ""
+    hit = usage.get("prompt_cache_hit_tokens")
+    if hit is None:
+        hit = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    total = usage.get("prompt_tokens")
+    if hit is None and miss is None:
+        return ""
+    hit = int(hit or 0)
+    miss = int(miss if miss is not None else max(0, int(total or 0) - hit))
+    total_n = int(total or (hit + miss))
+    ratio = (hit / total_n * 100) if total_n else 0.0
+    return f"缓存命中: hit={hit} miss={miss} 命中率={ratio:.1f}% (总 {total_n})"
+
+
 def log_round(messages: list, raw_reply: str = "", parsed=None,
               state_before: dict = None, state_after: dict = None,
               error: str = "") -> Path:
@@ -157,7 +196,9 @@ def log_round(messages: list, raw_reply: str = "", parsed=None,
         return Path()
     _ensure_dir()
     reasoning = ""
+    cache = ""
     if isinstance(raw_reply, dict):
+        cache = _cache_line(raw_reply)
         try:
             msg = raw_reply["choices"][0]["message"]
             for key in ("reasoning_content", "reasoning"):
@@ -189,6 +230,9 @@ def log_round(messages: list, raw_reply: str = "", parsed=None,
         lines += [
             "【LLM 推理内容】",
             reasoning or "（无）",
+            "",
+            "【缓存命中】",
+            cache or "（端点未返回缓存字段）",
             "",
             "【LLM 原始响应】",
             raw_reply or "（空）",
@@ -250,8 +294,25 @@ def selftest() -> None:
         assert "最终交付给 LLM 的完整消息" in text
         assert "SYSTEM（最终交付给 LLM 的提示词）" in text
         assert "LLM 原始响应" in text and "好感度: 31/100" in text
+        # 缓存命中记录：响应 dict 带 usage → 回合日志含缓存统计行；
+        # 无缓存字段 → 标注缺失
+        log_round([{"role": "system", "content": "p"}],
+                  raw_reply={"choices": [{"message": {"content": "x"}}],
+                             "usage": {"prompt_tokens": 100,
+                                       "prompt_cache_hit_tokens": 30,
+                                       "prompt_cache_miss_tokens": 70}},
+                  parsed=None)
+        assert "缓存命中: hit=30 miss=70 命中率=30.0% (总 100)" in read_log(list_logs()[-1])
+        log_round([{"role": "system", "content": "p"}],
+                  raw_reply={"choices": [{"message": {"content": "x"}}]}, parsed=None)
+        assert "（端点未返回缓存字段）" in read_log(list_logs()[-1])
+        # 通用 LLM 调用日志：cache 参数写入文件头
+        log_llm_call("merge", "prompt-x", "resp-y", cache="缓存命中: hit=1 miss=2 命中率=33.3% (总 3)")
+        llm_files = sorted(LOG_DIR.glob("llm_*.txt"))
+        assert llm_files, "应生成 llm_ 日志"
+        assert "cache: 缓存命中: hit=1 miss=2" in llm_files[-1].read_text(encoding="utf-8")
         print(f"[logutil.selftest] 通过 ✓ 保留 {len(files)} 条 | "
-              f"最旧含 prompt-2，最新含 prompt-11")
+              f"最旧含 prompt-2，最新含 prompt-11 | 缓存命中记录 ✓")
     finally:
         globals()["LOG_DIR"] = saved
         import shutil

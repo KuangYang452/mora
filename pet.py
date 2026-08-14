@@ -40,13 +40,16 @@ from llm import (
     build_activation,
     build_system_prompt,
     call_llm,
+    env_section,
     extract_tool_calls,
     get_character,
     has_query_intent,
     parse_llm_response,
+    state_section,
     summarize_history,
     thinking_style_for,
     tool_result_text,
+    turn_section,
 )
 from rmgame.bridge import execute_tool
 from rmgame import facade as rmgame_facade
@@ -115,6 +118,33 @@ EMOTE_MARKS = {
     "戏谑": "😼",
     "撒娇": "🥺",
 }
+
+
+# 工具调用的紧凑单行呈现（累积思路链内的反引号行）
+# ---------------------------------------------------------------------------
+
+def _compact_call(name: str, args: dict) -> str:
+    """工具调用的紧凑单行呈现：scan_game:猎妻迷宫。
+
+    无参数 → 名称；单参数 → 名称:值；game 参数单独括注 →
+    query_wiki:神秘人（猎妻迷宫）；其余多参数 → 名称:k=v、k=v。
+    供累积思路链内的反引号工具调用行使用（如 `read_current_text:猎妻迷宫`），
+    让模型看到的循环文本可读、可复述，而不是 JSON 参数块。
+    """
+    if not args:
+        return name
+    game = str(args.get("game") or "").strip()[:40]
+    others = {k: v for k, v in args.items() if k != "game"}
+    body_parts = []
+    for k, v in others.items():
+        s = str(v).strip()[:40]
+        body_parts.append(s if len(others) == 1 else f"{k}={s}")
+    body = "、".join(body_parts)
+    if not body:
+        return f"{name}:{game}" if game else name
+    if game:
+        return f"{name}:{body}（{game}）"
+    return f"{name}:{body}"
 
 
 class MoraPet:
@@ -227,6 +257,12 @@ class MoraPet:
         桌宠常驻期间持续跟踪已注册游戏的运行状态（CDP → OCR 兜底），
         让【对方正在…】环境段与 read_current_text 始终有数据可用。
         守护线程异常不影响桌宠本体。
+
+        空库也必须拉起：自动发现（rmgame_auto_discover）正是为「运行中的
+        未入库新游戏」设计的，而首个游戏入库前库为空 —— 若这里因库空而
+        直接 return，守护线程永远不会启动，新游戏就永远发现不了
+        （鸡生蛋问题）。monitor_loop_all 每轮重读 games.json 并自行
+        执行自动发现，传入的空列表只作占位。
         """
         if not CONFIG.get("rmgame_enabled", True) \
                 or not CONFIG.get("monitor_auto_start", True):
@@ -234,8 +270,6 @@ class MoraPet:
         try:
             games = rmgame_facade.games()
         except Exception:
-            return
-        if not games:
             return
         interval = float(CONFIG.get("rmgame_monitor_interval", 2.0))
 
@@ -642,11 +676,18 @@ class MoraPet:
         调用工具（输出最终台词）或到达轮数上限。中间轮次若有台词会即时
         显示并累积，回合结束时与最终台词合并为一条 assistant 消息进历史
         （一次输入的多轮推进在上下文里只算一条，中间对话内容不丢弃）。
+        工具结果回传：每轮工具调用后回传配对的 tool 角色消息（OpenAI
+        兼容协议必需，缺失会导致 400）；agent_msgs 只保留最近一轮配对
+        （更早的 tool 结果不再保留），跨轮信息由 think 链承载——最新
+        assistant 消息的 <think> 块含完整累积链。
         所有 UI 操作经 root.after 调度回主线程（tkinter 非线程安全）。
         """
         max_turns = max(1, int(CONFIG.get("agent_max_turns", 4)))
         self._summary_pending = set()   # 本回合摘要触发去重（生成失败下回合重试）
-        agent_msgs = []          # 本回合累积：assistant(tool_calls) + tool 结果
+        self._think_chain = ""          # 本回合累积思路链（每轮追加，块不闭合）
+        self._queried_before = False    # 本回合是否已调过查询工具（意向-动作校验）
+        self._queried_count = 0         # 本输入内查询工具调用次数（重复查询校验）
+        agent_msgs = []          # 本回合累积：最近一轮 assistant(累积链) + tool 结果
         interim_lines = []       # 中间轮台词（回合末与最终台词合并为一条进历史）
         last_parsed = None
         last_content = ""
@@ -657,18 +698,27 @@ class MoraPet:
             self.ctx.ensure_merged(self._merge_history)
             for turn in range(1, max_turns + 1):
                 retried_this_turn = False
-                # 每轮重建 system prompt，使【当前状态】反映最新结算结果，
-                # 并注入游戏环境快照（对方正在玩的 RPG Maker 游戏）
+                # 每轮重建 system prompt：只含静态段（身份/性格/情境/记忆/
+                # 等级规则/技能/协议）；动态段（状态/环境/推进）作为独立
+                # system 消息注入历史之后（pre_time），静态段与历史段因此
+                # 成为稳定缓存前缀（静态在前、动态在后）。
                 env = self._env_snapshot()
                 self._ensure_event_summary(env)   # 需要回应前：缺失则同步生成摘要（生成完才组装提示词）
                 self.sys_prompt = build_system_prompt(
-                    self.card, state=self.state, env=env,
-                    agent_turn=(turn, max_turns))
+                    self.card, state=self.state, env=env)
+                pre_time = []
+                pre_time.append(state_section(self.state))
+                es = env_section(env) if env else None
+                if es:
+                    pre_time.append(es)
+                pre_time.append(turn_section((turn, max_turns)))
                 messages = self.ctx.build_messages(
                     self.sys_prompt,
                     activation=build_activation(self.state, self.card),
-                    first_user_instr=thinking_style_for(self.state)
-                ) + agent_msgs  # 倒数第一条：激活指令（含心理 COT <think> 块）
+                    first_user_instr=thinking_style_for(self.state),
+                    pre_time=pre_time,
+                )
+                messages += agent_msgs
                 self._last_messages = messages
                 raw = call_llm(messages, tools=_build_tools(), kind="round",
                                retry=True, note="回合对话")
@@ -683,17 +733,11 @@ class MoraPet:
                 msg = raw["choices"][0]["message"]
                 last_content = (msg.get("content") or "").strip()
                 calls = extract_tool_calls(raw)
-                # 本回合此前是否已调用过查询工具（agent_msgs 中 assistant 消息的
-                # tool_calls 是否命中查询类）——已查过说明查询动机已兑现，
-                # 后续收尾台词引用"翻书/查过"等是修辞总结而非新意图，不再拦截。
-                queried_before = any(
-                    m["role"] == "assistant"
-                    and any(
-                        t.get("function", {}).get("name") in _QUERY_TOOL_NAMES
-                        for t in (m.get("tool_calls") or [])
-                    )
-                    for m in agent_msgs
-                )
+                # 本回合此前是否已调用过查询工具：用回合内持久标志
+                # （agent_msgs 只保留最近一轮，无法再从旧轮 tool_calls 判断）——
+                # 已查过说明查询动机已兑现，后续收尾台词引用"翻书/查过"等
+                # 是修辞总结而非新意图，不再拦截。
+                queried_before = self._queried_before
                 # 意向-动作校验（防"说了要查却只演翻书"）：台词出现查询意向
                 # 且本回合此前未查过、本子轮也未调任何查询工具 → 追加修复指令重试一次。
                 # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归校验。
@@ -703,7 +747,9 @@ class MoraPet:
                         and not queried_before
                         and not any(c["name"] in _QUERY_TOOL_NAMES for c in calls)
                         and has_query_intent(parsed.reply)):
-                    fix_msgs = messages + agent_msgs + [
+                    # messages 已含 agent_msgs（上方 messages += agent_msgs），
+                    # 此处只追加本条响应与修复指令，不再重复拼接 agent_msgs。
+                    fix_msgs = messages + [
                         {"role": "assistant", "content": msg.get("content") or ""},
                         {"role": "user",
                          "content": "（你刚才提到翻书/查询，但没有调用任何查询工具。"
@@ -735,7 +781,8 @@ class MoraPet:
                         and agent_msgs
                         and not calls
                         and last_content):
-                    fix_msgs = messages + agent_msgs + [
+                    # messages 已含 agent_msgs，同上只追加本条响应与修复指令。
+                    fix_msgs = messages + [
                         {"role": "assistant", "content": msg.get("content") or ""},
                         {"role": "user",
                          "content": "（你已调用工具推进工作，请调用 say 工具说出"
@@ -743,6 +790,66 @@ class MoraPet:
                     self._last_messages = fix_msgs
                     raw = call_llm(fix_msgs, tools=_build_tools(), kind="round",
                                    retry=True, note="回合对话（工具收尾校验重试）")
+                    parsed = parse_llm_response(raw)
+                    state_before = dict(self.state)
+                    self.state = apply_state(self.state, parsed)
+                    self._run_tools(parsed)
+                    logutil.log_round(fix_msgs, raw_reply=raw, parsed=parsed,
+                                      state_before=state_before, state_after=self.state)
+                    last_parsed = parsed
+                    msg = raw["choices"][0]["message"]
+                    last_content = (msg.get("content") or "").strip()
+                    calls = extract_tool_calls(raw)
+                    retried_this_turn = True
+                # 达上限强制交付：末轮（turn >= max_turns）仍调非 say 工具 →
+                # 重试一次强制 say，避免工具循环耗尽截断、无台词收尾
+                # （见日志 052450 输入16：8 轮交替查询从不 say，达上限后无回复）。
+                # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
+                if (turn >= max_turns and not retried_this_turn
+                        and calls and not any(c["name"] == "say" for c in calls)):
+                    fix_msgs = messages + [
+                        {"role": "assistant", "content": msg.get("content") or ""},
+                        {"role": "user",
+                         "content": "（本回合已达工具调用上限。请直接调用 say 工具"
+                                    "说出台词结束本回合，不要再调用其他工具；"
+                                    "基于已查到的内容作答即可。）"}]
+                    self._last_messages = fix_msgs
+                    raw = call_llm(fix_msgs, tools=_build_tools(), kind="round",
+                                   retry=True, note="回合对话（达上限强制交付重试）")
+                    parsed = parse_llm_response(raw)
+                    state_before = dict(self.state)
+                    self.state = apply_state(self.state, parsed)
+                    self._run_tools(parsed)
+                    logutil.log_round(fix_msgs, raw_reply=raw, parsed=parsed,
+                                      state_before=state_before, state_after=self.state)
+                    last_parsed = parsed
+                    msg = raw["choices"][0]["message"]
+                    last_content = (msg.get("content") or "").strip()
+                    calls = extract_tool_calls(raw)
+                    retried_this_turn = True
+                # 重复查询校验（防"结论已出仍重复拉取同一内容"）：本回合又调
+                # 查询工具、且本输入此前已查询过 → 注入修复指令重试一次。
+                # 见日志 0559xx：同一输入内 read+wiki 重复 3 轮、返回逐字相同
+                # （快照/词条均未变化），think 结论每轮重写——查询结果只保留
+                # 最近一轮，think 轮后上一轮结果已从上下文移除，模型被迫重查。
+                # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
+                if (CONFIG.get("retry_on_repeated_query", True)
+                        and not retried_this_turn
+                        and self._queried_count >= 1
+                        and any(c["name"] in _QUERY_TOOL_NAMES
+                               or c["name"] == "query_archive" for c in calls)
+                        and not any(c["name"] == "say" for c in calls)):
+                    fix_msgs = messages + [
+                        {"role": "assistant", "content": msg.get("content") or ""},
+                        {"role": "user",
+                         "content": "（你已在本回合完成过一轮查询，think 结论中"
+                                    "已记录答案依据。不要重复查询相同内容："
+                                    "若信息已足够，请直接调用 say 工具说出台词；"
+                                    "仅当确需查证不同的新内容时，才一次性批量"
+                                    "查询后再交付。）"}]
+                    self._last_messages = fix_msgs
+                    raw = call_llm(fix_msgs, tools=_build_tools(), kind="round",
+                                   retry=True, note="回合对话（重复查询校验重试）")
                     parsed = parse_llm_response(raw)
                     state_before = dict(self.state)
                     self.state = apply_state(self.state, parsed)
@@ -768,18 +875,67 @@ class MoraPet:
                     # 进历史，保留全部对话内容但不拆散上下文）
                     interim_lines.append(parsed.reply)
                     self.root.after(0, lambda p=parsed: self._show_interim(p))
-                # 模型要求继续：回传 assistant(tool_calls) + 各工具执行结果
+                # 思路链按轮次累积：think 内容以裸文本追加，查询/读取类工具
+                # 调用以单行反引号追加（如 `read_current_text:猎妻迷宫`），
+                # 读起来就是一条连续展开、可复述自己每一步的思维链。
+                # update_state 不入链（见日志 0617xx）：其参数是状态字段而非
+                # 推理内容——inner_thought 是跨回合持久状态（与 think 回合内
+                # 推理是两条通道），且长值会被 _compact_call 截成残句；完整
+                # 效果经 tool 消息回传，模型可见，无需在链内重复。
+                additions = []
+                for c in calls:
+                    try:
+                        cargs = json.loads(c.get("arguments") or "{}")
+                    except json.JSONDecodeError:
+                        cargs = {}
+                    if c["name"] == "think":
+                        t = str(cargs.get("content", "") or "").strip()
+                        if t:
+                            additions.append(t)
+                    elif c["name"] != "update_state":
+                        additions.append(
+                            f"`{_compact_call(c['name'], cargs)}`")
+                head = (msg.get("content") or "").strip()
+                if head and not self._think_chain:
+                    additions.insert(0, head)
+                if additions:
+                    self._think_chain = (
+                        "\n".join([self._think_chain, *additions])
+                        if self._think_chain else "\n".join(additions))
+                # 回传本轮：一条 assistant 累积思路链（<think> 开头、块不闭合、
+                # 含 think 文本与反引号工具调用行）+ 每条工具调用的 tool 角色
+                # 结果消息。
+                # assistant 消息保留 tool_calls 字段：协议必需配对（见下）。
+                # ⚠️ OpenAI 兼容协议硬性要求：带 tool_calls 的 assistant 消息
+                # 之后必须紧跟每个 tool_call_id 对应的 tool 角色消息，否则 API
+                # 直接返回 400（"An assistant message with 'tool_calls' must be
+                # followed by tool messages responding to each 'tool_call_id'"）。
+                # 曾因省略 tool 消息导致多轮循环从第 2 轮起必挂（见日志 022417/
+                # 022513 的 400 报错）。
                 agent_msgs.append({
                     "role": "assistant",
-                    "content": msg.get("content") or "",
+                    "content": "<think>\n" + self._think_chain,
                     "tool_calls": msg.get("tool_calls"),
                 })
                 for c in calls:
-                    agent_msgs.append({
+                    if c["name"] in _QUERY_TOOL_NAMES or c["name"] == "query_archive":
+                        self._queried_before = True   # 已实际调用过查询工具
+                        self._queried_count += 1      # 本输入内查询调用计数（重复查询校验）
+                    result = self._tool_result(c)     # 执行工具（副作用）
+                    agent_msgs.append({               # tool 角色消息：协议必需配对
                         "role": "tool",
-                        "tool_call_id": c["id"],
-                        "content": self._tool_result(c),
+                        "tool_call_id": c.get("id") or "",
+                        "content": result,
                     })
+                # 只保留最近一轮配对：旧轮 assistant(tool_calls)+tool 整对移除，
+                # 避免工具结果随轮数线性累积（上下文成本有界）。跨轮信息由
+                # think 链承载——最新 assistant 消息的 <think> 块含完整累积链，
+                # 推理过程不丢；旧轮 tool 结果如需跨轮引用须已写入 think。
+                last_asst = max(
+                    (i for i, m in enumerate(agent_msgs)
+                     if m.get("role") == "assistant"), default=None)
+                if last_asst is not None and last_asst > 0:
+                    agent_msgs = agent_msgs[last_asst:]
             self.root.after(0, lambda p=last_parsed, f=finished, c=last_content,
                             il=list(interim_lines):
                             self._finish_agent(p, not f, c, il))
@@ -810,11 +966,11 @@ class MoraPet:
         （保留全部对话内容，一次输入的多轮推进在上下文里只算一条）。
         """
         if parsed is None:
-            reply = self.card.instantiate(
-                self.card.fallback("silent") or "（{{char_self}}只是安静地看着你）")
+            reply = self.char.instantiate(
+                self.char.fallback("silent") or "（{{char_self}}只是安静地看着你）")
         elif truncated and not last_content:
-            reply = self.card.instantiate(
-                self.card.fallback("working") or "（{{char_self}}还在忙…下次再来听结果吧）")
+            reply = self.char.instantiate(
+                self.char.fallback("working") or "（{{char_self}}还在忙…下次再来听结果吧）")
         else:
             reply = parsed.reply
         merged = "\n".join([t for t in (interim_lines or []) if t] + [reply])
@@ -831,8 +987,15 @@ class MoraPet:
         return summarize_history(to_merge, old_merge=old_merge)
 
     def _tool_result(self, call: dict) -> str:
-        """工具执行结果回传：update_state 走状态文本；query_archive 走归档；
-        其余走 rmgame bridge。调用参数与返回内容同时输出到控制台。
+        """执行工具并返回结果文本（由调用方回传为 tool 角色消息）。
+
+        query_archive 走归档、mora_notes 走笔记、其余走 rmgame bridge；
+        update_state 返回语义化状态文本、think 仅占位（内容已入思路链）。
+        工具调用信息已由 _request_llm 以单行反引号追加进累积思路链
+        （如 `read_current_text:猎妻迷宫`）。返回的 result 由 _request_llm
+        追加为配对 tool_call_id 的 tool 角色消息（OpenAI 兼容协议必需，
+        缺失会导致 400）；agent_msgs 只保留最近一轮配对，完整返回内容
+        同时输出到控制台供调试。
 
         call：extract_tool_calls 提取的 {id, name, arguments}。
         """
@@ -850,6 +1013,11 @@ class MoraPet:
             # 不要落进 rmgame bridge 报"未知工具"误导模型。
             result = ("emote / bounce 不是独立工具：请通过 update_state 工具的 "
                       "emote / bounce 参数表达情绪与动作。")
+        elif name == "think":
+            # 推理草稿通道：内容已由 _request_llm 追加进累积思路链（<think>
+            # 块），此处无副作用，仅占位（think 调用随 agent_msgs 本回合内
+            # 可见，回合结束一并丢弃，不进入 ctx.history）。
+            result = "think（内容已入思路链）"
         elif name == "query_archive":
             result = self.ctx.query_archive(query=args.get("query"),
                                             limit=args.get("limit", 5),
@@ -863,12 +1031,11 @@ class MoraPet:
             # 重建结果都属游戏世界，用 <game_data> 标签与角色的身份、对话空间
             # 隔离（与环境段的 <game_environment> 同一套标签体系）。
             result = f"<game_data>\n{result}\n</game_data>"
-        if name != "update_state":
-            # 统一收尾指引：任何工具执行后都引导回 say 通道（update_state 的
-            # tool_result_text 已自带类似指引，不重复追加），避免模型查询完
-            # 直接 content 直出结束、绕过台词工具。
-            result += ("\n\n你可以继续调用其他工具推进工作，"
-                       "或调用 say 工具说出台词结束本回合。")
+        if name in _QUERY_TOOL_NAMES or name == "query_archive":
+            # 查询结果留存提醒（结果只保留最近一轮，跨轮结论必须 think 记录）。
+            # 放在包裹外（元信息，不属于游戏世界内容）；见日志 052450 输入16：
+            # 模型 8 轮交替查询却从不 think 留存，结果全部随覆盖丢弃。
+            result += "\n\n查询结果仅保留最近一轮，关键结论请用 think 工具记录。"
         print(f"\n{'=' * 20} 工具调用: {name} {'=' * 20}")
         print(f"参数: {args_raw}")
         print(f"{'=' * 20} 工具返回 {'=' * 20}")
@@ -1206,16 +1373,16 @@ class MoraPet:
         最终台词经 _finish_agent 显示。问候台词会留在对话历史中，
         作为后续对话的上下文起点。
         恢复存档后重启：在消息里附上距上次对话的时间流逝（如
-        （距上次对话 3 小时）对方看向了角色），让角色感知时间间隔。
+        （距上次对话 3 小时）*对方看向了你*），让角色感知时间间隔。
         """
         if not CONFIG.get("greet_on_start", True) or self._busy:
             return
         self._busy = True
         gap = getattr(self, "_resume_gap", None)
         if gap:
-            self.ctx.add_user(f"（{gap}）{USER_REFERENCE}看向了角色")
+            self.ctx.add_user(f"（{gap}）*{USER_REFERENCE}看向了你*")
         else:
-            self.ctx.add_user(f"{USER_REFERENCE}看向了角色")
+            self.ctx.add_user(f"*{USER_REFERENCE}看向了你*")
         threading.Thread(target=self._request_llm, daemon=True).start()
 
     def _auto_chat(self):

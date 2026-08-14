@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """角色工具执行体 —— rmgame/bridge（M5）
 
 给角色的工具通道提供执行体：5 个 rmgame 工具 → 语义化结果文本
@@ -115,25 +115,40 @@ def _try_snapshot(g, port) -> str:
         return "（游戏加载中，稍后可用 read_current_text 读取文本。）"
 
 
+# 工具结果长度上限（字符）。原则：**精炼内容完整展示**——事件摘要（LLM
+# 提炼的全文概述）与 wiki 条目（概念重写产物）本就为"一次看完"而生成，
+# 截断等于浪费提炼；**原始内容才截断**——事件上下文（raw 原文）只作
+# 位置样本，逐字核对走 read_raw_text（按条目 id 取完整上下文）。
+_EVENT_CONTEXT_MAX = 250    # 事件上下文（原文）显示上限（字符）
+
+
 def _fmt_snapshot(cur: dict) -> str:
     parts = [f"游戏：{cur.get('game')}"]
     if cur.get("map_name") or cur.get("map_id") is not None:
         parts.append(f"地图：{cur.get('map_name') or cur.get('map_id')}")
     if cur.get("scene"):
         parts.append(f"场景：{cur.get('scene')}")
-    # 优先展示 raw 匹配到的精确原文（OCR 文本有噪声）
-    text = cur.get("matched_text") or cur.get("text") or "（无）"
-    parts.append(f"当前文本：{text}")
-    # 当前事件摘要：全文概述，含当前位置之前与之后的内容（可能剧透）；
-    # 仅经本工具提供（不进游戏环境段），细节以摘要末尾"以原文为准"声明为准
+    # 优先展示 raw 匹配到的精确原文（OCR 文本有噪声）；无文字时给出
+    # 止步信号，防止模型因"画面无文字"陷入反复查询循环（见日志 052450
+    # 输入16：8 轮交替查询空文本状态、无 think 留存、无 say 收尾）。
+    text = (cur.get("matched_text") or cur.get("text") or "").strip()
+    if text:
+        parts.append(f"当前文本：{text}")
+    else:
+        parts.append("当前文本：（无）——画面无文字（可能处于加载/过场/菜单间隙），"
+                     "重复查询通常不会变化，勿在短时间内反复查询同一状态；"
+                     "可直接点评当前状态或询问对方，或等场景变化后再查。")
+    # 当前事件摘要：LLM 提炼的全文概述（精炼内容，完整展示），含当前位置
+    # 之前与之后的内容（可能剧透）；仅经本工具提供（不进游戏环境段）
     es = (cur.get("event_summary") or "").strip()
     if es:
         parts.append("当前事件摘要（全文概述，含当前位置之前与之后的内容，可能剧透）：")
         parts.append(es)
-    # 事件完整上下文（同 event_id 对话流，原文供核对）
+    # 事件完整上下文（同 event_id 对话流，原文供核对；仅截断原始文本，
+    # 逐字核对请用 read_raw_text）
     ec = (cur.get("event_context") or "").strip()
     if ec:
-        parts.append(f"事件上下文（原文，供核对）：\n{ec[:800]}")
+        parts.append(f"事件上下文（原文，供核对；逐字核对请用 read_raw_text）：\n{ec[:_EVENT_CONTEXT_MAX]}")
     parts.append(f"来源：{cur.get('source')} | 最后更新：{cur.get('updated_at')}")
     return "\n".join(parts)
 
@@ -229,7 +244,12 @@ def _query_wiki(args: dict) -> str:
 
 
 def _fmt_concept_body(c: dict, res: dict) -> str:
-    """概念条目语义化展示（摘要/别名 + 内容截断），查询/收录/别名复用。"""
+    """概念条目语义化展示（摘要/别名 + 条目内容）。
+
+    条目内容为 LLM 重写的精炼产物，完整展示（上限 6000 字符仅防失控条目；
+    多概念命中时本就只给第一条完整条目，其余走摘要行，见 _query_wiki）。
+    查询/收录/别名复用。
+    """
     out = []
     if c.get("summary"):
         out.append(f"摘要：{c['summary']}")
@@ -237,7 +257,7 @@ def _fmt_concept_body(c: dict, res: dict) -> str:
         out.append(f"别名：{'、'.join(c['aliases'])}")
     if res.get("content"):
         out.append("——条目内容——")
-        out.append(res["content"][:1500])  # 控制回传体积
+        out.append(res["content"][:6000])
     else:
         out.append("（条目内容暂不可用，稍后重试）")
     return "\n".join(out)
@@ -425,7 +445,7 @@ def _wiki_rebuild(args: dict) -> str:
     out.append(f"摘要：{c.get('summary', '')}")
     out.append(f"引用：{', '.join(c.get('refs', []))}")
     out.append("——条目内容——")
-    out.append((res.get("content") or "")[:1500])
+    out.append((res.get("content") or "")[:6000])
     return "\n".join(out)
 
 

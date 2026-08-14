@@ -23,14 +23,15 @@ auto_chat_minutes = 10      ; 闲置闲聊初始间隔（分钟）；0 关闭
 auto_chat_max_minutes = 2880 ; 闲置闲聊最大间隔（48 小时）
 auto_chat_growth = 2.0      ; 每次闲置触发后间隔倍率
 auto_chat_min_gap_seconds = 60 ; 闲置触发保护窗口（秒）
-history_rounds = 30         ; 上下文保留轮数
-context_keep_recent = 10    ; 最新保留的未合并消息条数
-context_keep_mid = 20       ; 较新缓冲条数（合并阈值 = recent + mid）
+history_rounds = 30         ; 上下文保留轮数（发给模型的历史上限 = 轮数×2 条消息）
+context_keep_recent = 20    ; 最新保留的未合并消息条数（合并后回落）
+context_keep_mid = 40       ; 较新缓冲条数（合并阈值 = recent + mid）
 agent_max_turns = 8         ; 一次输入内 LLM 最多自主调用轮数
 speech_as_tool = true       ; 台词强制走 say 工具
 tool_choice = required      ; 工具调用强制模式：required / auto
 retry_on_vague_query = true ; 说了要查但没调查询工具 → 重试
 force_say_to_finish = true  ; 调了工具但未走 say → 重试
+retry_on_repeated_query = true ; 同一输入内二次查询（结果已可得/think 已有结论）→ 引导直接交付
 mesugaki_style_block = false ; 注入角色卡 <Mesugaki> 风格块（旧模块，默认关闭）
 
 ; ---- RPG Maker 点评工具（rmgame）----

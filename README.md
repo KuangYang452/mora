@@ -1,4 +1,7 @@
-# LLM 桌面宠物框架（桌宠莫拉 v1.0）
+# LLM 桌面宠物框架（桌宠莫拉 v1.1.0）
+
+> 当前版本 v1.1.0（`python debug.py --version`；更新记录见 CHANGELOG.md，
+> 版本规范见 docs/VERSIONING.md，版本号唯一来源 settings.VERSION）。
 
 一个 LLM 驱动的桌面宠物框架：角色常驻你的电脑桌面，通过 OpenAI 兼容 API
 （DeepSeek / OpenAI / Ollama 等）驱动对话、状态演化与工具调用。
@@ -50,15 +53,20 @@ rmgame/         RPG Maker 点评工具包（discovery/extract/wiki/monitor/cdp/o
    `runtime/pet_session.json`（`persist.py`，路径由 `settings.save_dir()` 中心化）：
    每次回合结束与退出时保存（含 `saved_at` 与每条消息的时间标注），启动时恢复；
    存档缺失/损坏则回退初始状态与开场白。发往 LLM 的消息会剥离时间字段，但角色
-   **具备时间感知**：每回合【当前状态】注入当前时间；恢复存档后重启，开场消息会
-   附上"距上次对话 X 小时/天"的时间流逝描述。组装提示词时，上下文开头标注当前
-   时间，历史消息标注相对时间 —— 前缀**只加在 user 消息上**（`[5分钟前]` 半角
-   方括号元信息样式），assistant 消息保持纯台词，避免模型把「时间标注 + 台词」
+   **具备时间感知**：当前时间锚点随每回合注入；恢复存档后重启，开场消息会
+   附上"距上次对话 X 小时/天"的时间流逝描述。组装提示词时，**静态在前、
+   动态在后**：system 提示词只含静态段（身份/性格/情境/记忆/好感等级规则/
+   技能/行为协议），高频变化的动态段（【当前状态】——好感度数值隐去只留
+   等级与内心想法、【对方正在…】游戏环境快照、【本回合推进】轮次计数）
+   作为独立 system 消息注入**历史之后、时间锚点之前**——静态段与历史段
+   因此成为稳定缓存前缀；历史消息标注**绝对时间** —— 前缀**只加在 user
+   消息上**（`[08-14 23:50]` 半角方括号元信息样式，由消息绝对时间确定、
+   逐字节稳定），assistant 消息保持纯台词，避免模型把「时间标注 + 台词」
    当成自己的发言格式模仿进输出。模型输出经 `strip_time_prefix` 硬清洗兜底。
    上下文过长时自动**合并归档**：未合并原文最多保留
    `CONFIG["context_keep_recent"] + CONFIG["context_keep_mid"]` 条（默认
-   10 + 20 = 30）；超过后由 LLM 把最旧部分压缩为一条带时间标注的**新合并结果**，
-   上下文回落到**最近 10 条原文 + 1 条合并结果**；被合并的原始消息与摘要归档
+   20 + 40 = 60）；超过后由 LLM 把最旧部分压缩为一条带时间标注的**新合并结果**，
+   上下文回落到**最近 20 条原文 + 1 条合并结果**；被合并的原始消息与摘要归档
    （`archives`），可用 `query_archive` 工具查询。
 2. **提示词完全语义化**。交付给 LLM 的系统提示词只有自然语言叙述：
    状态用「此刻你与对方的关系：好感度 20/100，处于『初遇』阶段……」这样的
@@ -160,14 +168,15 @@ reasoning_effort = medium
   `http://localhost:11434/v1` / Kimi / 通义等）。
 - `api_key`：必填。`base_url`、`api_key`、`model` 缺一不可，缺了启动时直接报错。
 - 不用环境变量，不写代码 —— 写在任何其他位置的配置都不会生效。
-- `reasoning`：思考模式开关（DeepSeek API 的 `thinking.type`）；关闭时自动适配：
-  不注入思维链提示词，并**禁用 `fetish_analysis`**（心理分析依赖推理链）。
+- `reasoning`：原生思考模式开关（DeepSeek API 的 `thinking.type`）。**推理内容
+  不依赖它**：工具循环内的推理走 `think` 工具（思维链风格指令、心理COT、
+  `fetish_analysis` 技能始终可用，reasoning 开闭都不影响）。
 - `reasoning_effort`：推理强度，合法值 `none` / `minimal` / `low` / `medium` /
-  `high` / `xhigh` / `max`。
+  `high` / `xhigh` / `max`（仅原生思考开启时有意义）。
 - 注意：**思考模式（`reasoning: true`）与 `tool_choice: "required"` 互斥**
   （API 返回 "Thinking mode does not support this tool_choice"）；想用强制工具
   模式只能关思考（`reasoning: false`，`app.ini` 的 `tool_choice = required` 即
-  默认配套）。
+  默认配套）。推理需求由 `think` 工具承担。
 - 用 `python debug.py --llm` 查看当前生效的配置（密钥脱敏显示）。
 - 本工具自身不做内容过滤；第三方 API 服务商可能有自己的内容政策。
 
@@ -272,8 +281,8 @@ python pet.py
 
 ## RPG Maker 点评工具（rmgame）
 
-为桌宠增加"点评 RPG Maker 引擎游戏文本"的能力。设计文档：`RPG_MAKER_TOOL.md`。
-新世代（MV/MZ）优先，老世代（XP/VX/Ace）扫描器预留。三个功能：
+为桌宠增加"点评 RPG Maker 引擎游戏文本"的能力。设计文档：`docs/RPG_MAKER_TOOL.md`
+（内部设计文档，不入库）。新世代（MV/MZ）优先，老世代（XP/VX/Ace）扫描器预留。三个功能：
 
 1. **扫描提取**：识别硬盘上的 RPG Maker 游戏（`Game.exe` + `data/` JSON），
    解析事件命令流（对话/选项/分支，含公共事件/战斗事件）→ `raw/<游戏>/`；

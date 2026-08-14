@@ -5,6 +5,7 @@
 
 用法：
   python debug.py             # 打印组装好的完整 system prompt（逐段 + 统计）
+  python debug.py --version   # 打印当前版本号（settings.VERSION）
   python debug.py --llm       # 打印当前生效的 LLM 配置（密钥脱敏）
   python debug.py --state     # 打印当前硬编码状态（好感度/内心想法/等级映射）
   python debug.py --list      # 列出 log/ 下的日志文件
@@ -102,13 +103,19 @@ def clean_logs() -> None:
     print(f"已清空 log/（删除 {len(logs)} 条日志）。")
 
 
+def print_version() -> None:
+    print(f"v{settings.VERSION}（语义化版本，见 docs/VERSIONING.md 与 CHANGELOG.md）")
+
+
 def main() -> None:
     args = sys.argv[1:]
     if not args:
         print_prompt()
         return
     cmd = args[0]
-    if cmd == "--llm":
+    if cmd == "--version":
+        print_version()
+    elif cmd == "--llm":
         print_llm_config()
     elif cmd == "--state":
         print_state()

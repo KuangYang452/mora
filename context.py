@@ -4,13 +4,16 @@
 - 维护会话历史（内存，由 persist 落盘）：未合并消息 + 合并条目 + 归档
 - 注入开场白台词作为上下文文本流的起始（assistant 消息）
 - 每条消息带 time（ISO 时间戳）；组装 messages 时：
-  - 上下文开头标注当前时间（相对时间锚点）；
-  - 历史消息的绝对时间转为相对时间，以半角方括号元信息前缀标注
-    （[刚刚] / [5分钟前]，避免全角括号样式被模型模仿进台词）；
+  - 当前时间锚点放在消息序列后部、激活指令之前（动态内容置于尾部，
+    避免在开头切断缓存前缀，同时贴近生成位置）；
+  - 历史消息以**绝对时间**半角方括号元信息前缀标注（[08-14 23:50]，
+    由消息的绝对时间确定、逐字节稳定，不随请求时刻漂移——利于缓存
+    前缀连续命中；模型结合末尾时间锚点推算距离），避免全角括号样式
+    被模型模仿进台词；
   - 历史超过 keep_recent 条时，把最旧部分（含旧合并条目）交给合并函数
     压缩为一条合并条目（ensure_merged），旧内容归档，可经 query_archive
     查询；上下文只保留一条最新合并内容 + 未合并消息。
-- 发往 LLM 的 messages 剥离 time 字段，模型只看到相对时间标注。
+- 发往 LLM 的 messages 剥离 time 字段，模型只看到绝对时间标注。
 """
 
 from datetime import datetime
@@ -49,17 +52,41 @@ def rel_time(iso, now=None) -> str:
     return f"{days // 30}个月前"
 
 
-def _merge_time_span(merge: dict, now=None) -> str:
-    """合并摘要的时间窗：由被合并消息的绝对时间（time_min/time_max）按当前
-    时刻换算相对时间（如「这段对话发生于 3 小时前至 30 分钟前」）。
+def abs_time_label(iso) -> str:
+    """消息绝对时间 → 半角方括号绝对时间标注 [MM-DD HH:MM]；无法解析返回空串。
 
-    相对时间只在展示层换算——旧存档无 time_min/time_max 时返回空串
-    （不编造时间，也不暴露旧相对时间误导时间线）。
+    绝对时间由消息自身的 time 字段确定，**逐字节稳定**（不随请求时刻漂移），
+    用作 user 历史消息前缀——历史段因此成为稳定的缓存前缀；模型可结合
+    消息序列末尾的【当前时间】锚点推算每条消息距今多久。年份省略（锚点
+    提供年份上下文；跨年边界的歧义在桌宠会话时长下可接受）。
+    """
+    try:
+        dt = datetime.fromisoformat(str(iso or ""))
+    except (ValueError, TypeError):
+        return ""
+    return f"[{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}]"
+
+
+def _merge_time_span(merge: dict) -> str:
+    """合并摘要的时间窗：由被合并消息的绝对时间（time_min/time_max）格式化为
+    绝对时间窗（如「这段对话发生于 08-14 21:00 至 08-15 00:30」）。
+
+    绝对格式由存储的绝对时间确定、逐字节稳定（不随请求时刻漂移），
+    与绝对时间标签同一套约定，作为缓存前缀的稳定段；旧存档无
+    time_min/time_max 时返回空串（不编造时间）。
     """
     tmin, tmax = merge.get("time_min"), merge.get("time_max")
     if not tmin or not tmax:
         return ""
-    r1, r2 = rel_time(tmin, now), rel_time(tmax, now)
+
+    def _fmt(iso):
+        try:
+            dt = datetime.fromisoformat(str(iso))
+        except (ValueError, TypeError):
+            return None
+        return f"{dt.month:02d}-{dt.day:02d} {dt.hour:02d}:{dt.minute:02d}"
+
+    r1, r2 = _fmt(tmin), _fmt(tmax)
     if not r1 or not r2:
         return ""
     return f"这段对话发生于 {r1} 至 {r2}。"
@@ -95,7 +122,7 @@ class ContextManager:
 
     @staticmethod
     def _msg(role: str, text: str) -> dict:
-        """带时间标注的消息（time 供持久化；build_messages 转相对时间）。"""
+        """带时间标注的消息（time 供持久化；build_messages 转绝对时间标注）。"""
         return {"role": role, "content": text,
                 "time": datetime.now().isoformat(timespec="seconds")}
 
@@ -197,11 +224,25 @@ class ContextManager:
         return "\n\n".join(out)
 
     def build_messages(self, system_prompt: str, activation: str = None,
-                       first_user_instr: str = None) -> list:
+                       first_user_instr: str = None,
+                       pre_time: list = None) -> list:
         """组装发往 LLM 的完整消息。
 
-        system + 当前时间（相对时间锚点）+ 合并条目（若有）+ 未合并历史
-        （相对时间标注）+ 指令附加。所有 time 字段剥离，模型只见相对时间。
+        system + 合并条目（若有）+ 未合并历史（绝对时间标注）+ [pre_time
+        动态尾部段] + 当前时间（时间锚点）+ 指令附加。所有 time 字段剥离，
+        模型只见绝对时间标注。
+        当前时间锚点放在激活指令之前而非上下文开头：锚点内容逐请求动态
+        变化（「此刻是 …」分钟粒度），置于开头会在第二个消息处切断缓存
+        前缀（静态在前、动态在后）；放后部既保住前缀，又贴近生成位置
+        （近因效应），「以上对话消息」的说明放在被标注消息之后语义更顺。
+        历史消息用绝对时间标注（abs_time_label，逐字节稳定）而非相对时间
+        （相对标注会随请求时刻漂移、切断历史段缓存前缀）。
+
+        pre_time：高频变化的动态段（如【当前状态】/【对方正在…】/
+        【本回合推进】，见 llm.state_section / env_section / turn_section），
+        按给定顺序插在时间锚点之前——全部落在历史之后，使静态 system 段
+        与历史段成为稳定缓存前缀。元素为字符串（自动包成 system 消息）
+        或完整消息 dict。
 
         first_user_instr：思维链风格指令，追加到第一条 user 历史消息末尾
         （紧贴用户首句，靠近模型生成位置）；若历史中还没有 user 消息
@@ -209,19 +250,13 @@ class ContextManager:
         """
         now = datetime.now()
         msgs = [{"role": "system", "content": system_prompt}]
-        # 上下文开头：当前时间（相对时间锚点）
-        msgs.append({
-            "role": "system",
-            "content": f"【当前时间】{current_time_text()}。"
-                       "以下对话消息的时间标注为相对时间（如「5分钟前」）。",
-        })
         # 合并条目：更早历史的压缩（中期记忆层）
         # 措辞双重要求：明确「这是你的中期记忆」，同时保留防御语义——
         # 它是对更早对话的压缩，不是对方刚说的话，不要当作本回合发言来回应。
-        # 时间窗由程序按被合并消息的绝对时间换算（_merge_time_span），
-        # 不依赖 LLM 摘要中可能过时的相对时间。
+        # 时间窗由程序按被合并消息的绝对时间换算（_merge_time_span，绝对
+        # 格式、逐字节稳定），不依赖 LLM 摘要中可能过时的相对时间。
         if self.merge and (self.merge.get("summary") or "").strip():
-            span = _merge_time_span(self.merge, now)
+            span = _merge_time_span(self.merge)
             msgs.append({
                 "role": "system",
                 "content": "【中期记忆】以下是你对更早对话的压缩记忆，属于你的"
@@ -230,18 +265,18 @@ class ContextManager:
                            + (span + "\n" if span else "")
                            + self.merge["summary"].strip(),
             })
-        # 未合并历史：绝对时间 → 相对时间标注，只加在 user 消息上。
-        # 前缀用半角方括号 [刚刚] / [5分钟前]（元信息样式）。assistant 消息
+        # 未合并历史：绝对时间 → 半角方括号标注，只加在 user 消息上。
+        # 标注由消息绝对时间确定、逐字节稳定（缓存友好）。assistant 消息
         # 保持纯台词：若带前缀，模型会把「assistant 消息 = 时间标注 + 台词」
         # 当成自己的发言格式模仿进输出（旧全角括号样式曾导致（刚刚）污染）。
         trimmed = self.trimmed
         first_user_idx = next((i for i, m in enumerate(trimmed)
                                if m.get("role") == "user"), None)
         for i, m in enumerate(trimmed):
-            rel = rel_time(m.get("time"), now)
+            label = abs_time_label(m.get("time"))
             content = m.get("content", "")
-            if rel and m.get("role") == "user":
-                content = f"[{rel}] {content}"
+            if label and m.get("role") == "user":
+                content = f"{label} {content}"
             if first_user_instr and i == first_user_idx:
                 content = f"{content}\n\n{first_user_instr}"
             if m.get("role") == "assistant":
@@ -257,6 +292,24 @@ class ContextManager:
                 "role": "system",
                 "content": "【思维链风格】\n" + first_user_instr,
             })
+        # 动态尾部段（pre_time）：状态/环境/推进等高频变化内容，插在时间
+        # 锚点之前——全部位于历史之后，system 静态段与历史段不受其影响，
+        # 可连续命中缓存前缀（静态在前、动态在后）。
+        for seg in pre_time or []:
+            if isinstance(seg, dict):
+                msgs.append(seg)
+            else:
+                msgs.append({"role": "system", "content": str(seg)})
+        # 当前时间（时间锚点）：放在消息序列后部、激活指令之前。
+        # 内容随请求动态变化（「此刻是 …」逐分钟变），放开头会在头部切断
+        # 缓存前缀（静态在前、动态在后）；放后部不牺牲前缀，又贴近生成
+        # 位置（近因效应），说明文字用「以上」指向已出现的标注消息。
+        msgs.append({
+            "role": "system",
+            "content": f"【当前时间】{current_time_text()}。"
+                       "以上对话消息的标注为绝对时间（如「08-14 23:50」），"
+                       "可与当前时间比对推算距今多久。",
+        })
         if activation:
             msgs.append({
                 "role": "system",
@@ -279,13 +332,17 @@ def selftest() -> None:
     from datetime import timedelta
     now = datetime(2026, 8, 12, 22, 0, 0)
 
-    # 相对时间转换（微博风格）
+    # 相对时间转换（微博风格，供归档展示/合并输入等辅助通道使用）
     assert rel_time((now - timedelta(seconds=30)).isoformat(), now) == "刚刚"
     assert rel_time((now - timedelta(minutes=5)).isoformat(), now) == "5分钟前"
     assert rel_time((now - timedelta(hours=3)).isoformat(), now) == "3小时前"
     assert rel_time((now - timedelta(days=2)).isoformat(), now) == "2天前"
     assert rel_time((now - timedelta(days=45)).isoformat(), now) == "1个月前"
     assert rel_time("bad", now) == ""
+    # 绝对时间标注（主通道）：由消息绝对时间确定，逐字节稳定（缓存友好）
+    assert abs_time_label("2026-08-14T23:50:00") == "[08-14 23:50]"
+    assert abs_time_label("2026-01-02T03:04:05") == "[01-02 03:04]"
+    assert abs_time_label("bad") == "" and abs_time_label(None) == ""
 
     ctx = ContextManager(rounds=2, opening=["开场A", "开场B", "开场C"])
     assert [m["content"] for m in ctx.history] == ["开场A", "开场B", "开场C"], ctx.history
@@ -299,16 +356,23 @@ def selftest() -> None:
     assert all(t["content"] not in ("开场A", "开场B", "开场C") for t in ctx.trimmed)
     msgs = ctx.build_messages("SYS")
     assert msgs[0] == {"role": "system", "content": "SYS"}
-    # 结构：SYS + 当前时间头 + 4 条历史 = 6
+    # 结构：SYS + 4 条历史 + 当前时间（动态锚点移至后部）= 6
     assert len(msgs) == 6, [m["role"] for m in msgs]
-    assert "【当前时间】" in msgs[1]["content"], msgs[1]
+    assert "【当前时间】" in msgs[5]["content"], msgs[5]
     # 时间前缀只加在 user 消息上：assistant 历史保持纯台词，避免模型
     # 把「assistant 消息 = 时间标注 + 台词」当成自己的发言格式模仿进输出。
-    # trimmed 最后 4 条 = 你好(user) / 哼哼(assistant) / 再来(user) / 好的(assistant)
-    assert msgs[2]["role"] == "user" and msgs[2]["content"].startswith("["), msgs[2]
-    assert msgs[3]["role"] == "assistant" and msgs[3]["content"] == "哼哼～", msgs[3]
-    assert msgs[4]["role"] == "user" and msgs[4]["content"].startswith("["), msgs[4]
-    assert msgs[5]["role"] == "assistant" and msgs[5]["content"] == "好的～", msgs[5]
+    # trimmed 4 条 = 你好(user) / 哼哼(assistant) / 再来(user) / 好的(assistant)；
+    # 当前时间锚点在消息序列末尾（缓存：动态内容在后，不切头部前缀）。
+    # user 前缀为绝对时间标注（由消息自身 time 确定，逐字节稳定）
+    assert msgs[1]["role"] == "user" and msgs[1]["content"].startswith(
+        abs_time_label(ctx.history[0]["time"]) + " "), msgs[1]
+    assert msgs[2]["role"] == "assistant" and msgs[2]["content"] == "哼哼～", msgs[2]
+    assert msgs[3]["role"] == "user" and msgs[3]["content"].startswith(
+        abs_time_label(ctx.history[2]["time"]) + " "), msgs[3]
+    assert msgs[4]["role"] == "assistant" and msgs[4]["content"] == "好的～", msgs[4]
+    assert msgs[5]["role"] == "system" and "【当前时间】" in msgs[5]["content"], msgs[5]
+    assert "以上对话消息" in msgs[5]["content"], "锚点位于历史之后，说明应用「以上」"
+    assert "绝对时间" in msgs[5]["content"], "锚点应说明绝对时间标注约定"
     assert all("time" not in m for m in msgs), "messages 不应携带 time"
     # 历史括号清洗（临时措施）：assistant 历史带括号旁白 → 展示层清洗为
     # 纯台词（存储不变）；user 消息的括号（元信息如「（现在没人在说话）」）不清洗
@@ -332,12 +396,29 @@ def selftest() -> None:
     # first_user_instr：追加到第一条 user 历史消息末尾（紧贴用户首句）
     msgs3i = ctx.build_messages("SYS", first_user_instr="【思维模式要求】推理式")
     assert len(msgs3i) == len(msgs), "first_user_instr 不应改变消息条数"
-    fu = msgs3i[2]  # 第一条 user 历史（你好）
+    fu = msgs3i[1]  # 第一条 user 历史（你好）
     assert fu["role"] == "user" and fu["content"].endswith("【思维模式要求】推理式"), fu
-    assert fu["content"].startswith("["), "首句仍应带相对时间前缀"
+    assert fu["content"].startswith("["), "首句仍应带绝对时间前缀"
     # 后续 user 消息不重复注入；assistant 历史保持纯台词
-    assert "【思维模式要求】推理式" not in msgs3i[4]["content"], msgs3i[4]
-    assert msgs3i[3]["content"] == "哼哼～", msgs3i[3]
+    assert "【思维模式要求】推理式" not in msgs3i[3]["content"], msgs3i[3]
+    assert msgs3i[2]["content"] == "哼哼～", msgs3i[2]
+    assert msgs3i[4]["content"] == "好的～", msgs3i[4]
+    assert "【当前时间】" in msgs3i[5]["content"], "时间锚点仍在序列末尾"
+    # pre_time 动态尾部段：插在时间锚点之前（状态/环境/推进等高频变化内容）
+    msgs_pt = ctx.build_messages("SYS", pre_time=["段A", "段B"])
+    assert len(msgs_pt) == len(msgs) + 2, msgs_pt
+    assert msgs_pt[-3]["role"] == "system" and msgs_pt[-3]["content"] == "段A", msgs_pt[-3]
+    assert msgs_pt[-2]["role"] == "system" and msgs_pt[-2]["content"] == "段B", msgs_pt[-2]
+    assert "【当前时间】" in msgs_pt[-1]["content"], "pre_time 应在时间锚点之前"
+    # pre_time + 激活指令：激活仍为最后一条（时间锚点紧跟 pre_time）
+    msgs_pt3 = ctx.build_messages("SYS", activation="ACT", pre_time=["段A"])
+    assert msgs_pt3[-3]["content"] == "段A", msgs_pt3[-3]
+    assert "【当前时间】" in msgs_pt3[-2]["content"], msgs_pt3[-2]
+    assert msgs_pt3[-1]["role"] == "system" and "【本回合指令】" in msgs_pt3[-1]["content"], \
+        "激活指令仍为最后一条"
+    # pre_time 支持 None（不改变结构）
+    msgs_pt2 = ctx.build_messages("SYS", pre_time=None)
+    assert len(msgs_pt2) == len(msgs), "pre_time=None 不应改变结构"
     # 纯开场白（无 user 历史）：风格指令作为独立【思维链风格】system 消息
     ctx_open = ContextManager(rounds=2, opening=["开场A", "开场B"])
     msgs_open = ctx_open.build_messages("SYS", first_user_instr="【角色沉浸要求】沉浸式")
@@ -346,7 +427,7 @@ def selftest() -> None:
     assert style_msgs[0]["content"].startswith("【思维链风格】"), style_msgs[0]
 
     # 合并流程：超过阈值（keep_recent + keep_mid）才触发，合并后只留
-    # keep_recent 条原文 + 1 条已合并（默认阈值 10 + 20 = 30，回落 10）
+    # keep_recent 条原文 + 1 条已合并（默认阈值 20 + 40 = 60，回落 20）
     ctx2 = ContextManager(rounds=30, keep_recent=2, keep_mid=2)  # 阈值 4
     for i in range(10):
         ctx2.add_user(f"Q{i}")
@@ -379,12 +460,15 @@ def selftest() -> None:
     assert ctx_def.ensure_merged(lambda msgs_, old: "触发合并"), "超过 30 条应合并"
     assert len(ctx_def.history) == 10, f"默认合并后应回落为 10 条, 实际 {len(ctx_def.history)}"
     # 合并条目进入 build：system 角色、中期记忆标注（含防误用防御语义）
+    # 布局：SYS + 合并条目 + 2 条历史 + 当前时间锚点（合并条目在 [1]）
     msgs3 = ctx2.build_messages("SYS")
-    assert msgs3[2]["role"] == "system" and "中期记忆" in msgs3[2]["content"], msgs3[2]
-    assert "新合并摘要" in msgs3[2]["content"]
-    assert "不是对方刚说的话" in msgs3[2]["content"], "应保留防误用语义"
-    assert "更早的历史合并" not in msgs3[2]["content"], "旧标注应替换"
-    assert "非对话内容" not in msgs3[2]["content"], "旧标注应替换"
+    assert msgs3[1]["role"] == "system" and "中期记忆" in msgs3[1]["content"], msgs3[1]
+    assert "新合并摘要" in msgs3[1]["content"]
+    assert "不是对方刚说的话" in msgs3[1]["content"], "应保留防误用语义"
+    assert "更早的历史合并" not in msgs3[1]["content"], "旧标注应替换"
+    assert "非对话内容" not in msgs3[1]["content"], "旧标注应替换"
+    assert msgs3[-1]["role"] == "system" and "【当前时间】" in msgs3[-1]["content"], \
+        "时间锚点应在序列末尾（激活指令之前）"
 
     # 合并失败：不合并、本回合不重试、新输入后重试
     ctx3 = ContextManager(rounds=30, keep_recent=1, keep_mid=1)  # 阈值 2
@@ -415,7 +499,7 @@ def selftest() -> None:
     # 清空
     ctx2.clear()
     assert ctx2.history == [] and ctx2.merge is None and ctx2.archives == []
-    print("[context.selftest] 通过 ✓ 相对时间 / 当前时间头 / 合并与归档 / 归档查询 / messages 组装")
+    print("[context.selftest] 通过 ✓ 绝对时间标注 / 当前时间锚点 / 合并与归档 / 归档查询 / messages 组装")
 
 
 if __name__ == "__main__":

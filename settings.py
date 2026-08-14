@@ -23,6 +23,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 SETTING_DIR = ROOT / "setting"
 
+# 版本号唯一事实来源（语义化版本 MAJOR.MINOR.PATCH，见 docs/VERSIONING.md）：
+# 发布流程 = 全量自测 → CHANGELOG.md 归档 → 更新本常量 → 提交 → git tag v<版本>。
+VERSION = "1.1.0"
+
 
 class ConfigError(Exception):
     pass
@@ -53,7 +57,7 @@ def _get(cp, section: str, key: str, default=None):
 # 类型转换表：app.ini 全部读为字符串，按此表还原类型；未列出的键按 str。
 # 时间/时长类键统一浮点（允许小数）：bubble 秒与每字符毫秒、闲聊间隔秒、
 # 环境快照新鲜度秒 —— 曾误入 _INT_KEYS 导致 "3.0"/"10.0" 解析失败回退 0
-# （气泡停留 0ms 瞬间消失的根因，见 GAME_ONBOARDING_DESIGN.md 之外的问题记录）。
+# （气泡停留 0ms 瞬间消失的根因，见 docs/GAME_ONBOARDING_DESIGN.md 之外的问题记录）。
 _INT_KEYS = {
     "bubble_fade_ms", "bubble_type_ms", "bubble_pause_ms", "bubble_corner",
     "bubble_shadow", "auto_chat_minutes", "auto_chat_max_minutes",
