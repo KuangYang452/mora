@@ -1,0 +1,40 @@
+# ============ 运行数据与隐私（不入库） ============
+runtime/                 # 会话存档/游戏库/快照/笔记/事件摘要（含本机路径与对话历史）
+log/                     # 回合日志与 LLM 调用日志（含完整提示词）
+save/
+raw/                     # 第三方游戏文本提取（版权衍生内容）
+wiki/                    # 第三方游戏 LLM 衍生概念库
+
+# 配置：真实配置不入库，仅提交 *.example 模板
+setting/llm.ini
+setting/app.ini
+setting/user.ini
+
+# ============ 角色数据 ============
+# 用户自备角色不入库；原创演示角色 character/demo/ 例外（随仓库发布）
+character/*/
+!character/SCHEMA.md
+!character/__init__.py
+!character/demo/
+!character/demo/**
+
+# ============ 原型与二进制 ============
+prototype/
+codewhale-tui-windows-x64.exe
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ============ 开发工具 ============
+.codewhale/
+
+# 内部工作文档（含发布前版权清理说明，不入公开仓库）
+1.0_RELEASE_PLAN.md
+
+# ============ 系统/编辑器 ============
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

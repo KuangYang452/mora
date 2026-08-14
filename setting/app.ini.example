@@ -1,0 +1,53 @@
+; 应用运行配置模板 —— 复制为 app.ini 使用（程序只认 app.ini，不认本文件）
+; 角色专属项（立绘 sprite、语音色 speech_color）随角色走 character/<slug>/，
+; 不在本文件配置。
+
+[app]
+; ---- 外观 ----
+; 注意：本文件修改后需重启桌宠生效（配置在启动时读取一次）
+scale = 0.6                 ; 立绘缩放
+idle_bob = true             ; 呼吸浮动动画
+bubble_min_seconds = 10.0    ; 气泡最短停留时间（秒）
+bubble_read_ms_per_char = 150 ; 阅读速度：每字符停留毫秒数
+bubble_max_seconds = 30.0   ; 气泡单条最长停留时间（秒）
+bubble_fade_ms = 150        ; 气泡淡入/淡出时长（毫秒）
+bubble_type_ms = 18         ; 打字机每字符间隔（毫秒）
+bubble_pause_chars = 。！？…，；：、.  ; 打字机句读标点
+bubble_pause_ms = 160       ; 句读标点暂停额外毫秒
+bubble_corner = 14          ; 气泡圆角半径（像素）
+bubble_shadow = 3           ; 气泡阴影偏移（像素），0 关闭
+
+; ---- 行为 ----
+greet_on_start = true       ; 启动问候
+auto_chat_minutes = 10      ; 闲置闲聊初始间隔（分钟）；0 关闭
+auto_chat_max_minutes = 2880 ; 闲置闲聊最大间隔（48 小时）
+auto_chat_growth = 2.0      ; 每次闲置触发后间隔倍率
+auto_chat_min_gap_seconds = 60 ; 闲置触发保护窗口（秒）
+history_rounds = 30         ; 上下文保留轮数
+context_keep_recent = 10    ; 最新保留的未合并消息条数
+context_keep_mid = 20       ; 较新缓冲条数（合并阈值 = recent + mid）
+agent_max_turns = 8         ; 一次输入内 LLM 最多自主调用轮数
+speech_as_tool = true       ; 台词强制走 say 工具
+tool_choice = required      ; 工具调用强制模式：required / auto
+retry_on_vague_query = true ; 说了要查但没调查询工具 → 重试
+force_say_to_finish = true  ; 调了工具但未走 say → 重试
+mesugaki_style_block = false ; 注入角色卡 <Mesugaki> 风格块（旧模块，默认关闭）
+
+; ---- RPG Maker 点评工具（rmgame）----
+rmgame_enabled = true       ; 点评工具开关
+rmgame_cdp_enabled = true   ; CDP 调试端口读取开关；False = 纯 OCR
+rmgame_nwjs_sdk =           ; nwjs SDK 的 nw.exe 路径（旁路启动）；空 = 自动探测
+rmgame_env_fresh_seconds = 300 ; 环境快照新鲜度阈值（秒）；<=0 不注入
+monitor_auto_start = true   ; 启动时自动拉起 rmgame 监控
+rmgame_monitor_interval = 3.0 ; 监控轮询间隔（秒）
+rmgame_auto_discover = true ; 自动发现运行中的未注册游戏并入库（trust=auto，禁启动；
+                            ; 确认气泡/右键菜单允许后解锁启动）
+rmgame_confirm_bubble = true ; 新游戏自动发现后弹确认气泡（false = 仅右键菜单确认）
+
+; ---- 日志 ----
+log_enabled = true          ; 每回合写日志到 log/（保留最近 10 条）
+
+[paths]
+save_dir = runtime            ; 会话存档目录（pet_session.json；与 current.json 等运行时数据同目录）
+log_dir = log                 ; 日志目录
+character_dir = character     ; 角色数据目录

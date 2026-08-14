@@ -1,0 +1,17 @@
+; LLM 连接配置模板 —— 复制为 llm.ini 并填写（程序只认 llm.ini，不认本文件）
+; base_url / api_key / model 必填，缺失启动时报错，不静默兜底。
+; base_url 可为任意 OpenAI 兼容端点：DeepSeek / OpenAI / Ollama 本地
+; （http://localhost:11434/v1）/ Kimi / 通义等。
+
+[llm]
+base_url = https://api.deepseek.com/v1
+api_key = 在这里填写你的 API Key
+model = deepseek-chat
+temperature = 0.95
+max_tokens = 1024
+; reasoning：思考模式开关（DeepSeek thinking.type enabled/disabled）。
+; true = 开启思维链（与 tool_choice=required 互斥，详见 README）；
+; false = 关闭（推荐配合 app.ini 的 tool_choice=required 使用）。
+reasoning = false
+; reasoning_effort：推理强度，合法值 none / minimal / low / medium / high / xhigh / max
+reasoning_effort = medium
