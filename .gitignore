@@ -11,12 +11,13 @@ setting/app.ini
 setting/user.ini
 
 # ============ 角色数据 ============
-# 用户自备角色不入库；原创演示角色 character/demo/ 例外（随仓库发布）
+# 用户自备角色不入库；莫拉角色包 character/mora/ 例外（作者已授权
+# CC BY-NC-SA 4.0 分发，见 character/mora/CREDITS.md）
 character/*/
 !character/SCHEMA.md
 !character/__init__.py
-!character/demo/
-!character/demo/**
+!character/mora/
+!character/mora/**
 
 # ============ 原型与二进制 ============
 prototype/

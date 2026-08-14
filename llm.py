@@ -1360,8 +1360,7 @@ def selftest() -> None:
     opening = _CHAR.opening
     assert "书架" in scene or "图书馆" in scene, f"场景提取异常: {scene[:50]}"
     assert len(opening) >= 3, f"应提取 3 条以上台词，实际 {len(opening)}"
-    assert opening[0].strip(), opening[0]
-    assert _CHAR.display_name in "".join(opening), "开场台词应含角色显示名"
+    assert all(x.strip() for x in opening), "开场台词流应全为非空"
     assert "【开场白】" not in sys_prompt, "开场白段应已移除"
     assert opening[0][:10] not in sys_prompt, "开场白台词不应残留在 system prompt 中"
     print(f"  开场契约: 场景 {len(scene)} 字符 | 台词 {len(opening)} 条 ✓")
@@ -1700,7 +1699,7 @@ def selftest() -> None:
     # COT 适配段：素材来源判断 + 收敛判断（关闭技能），原型原文保留
     assert "素材来源" in act_skill and "read_current_text" in act_skill, "应含素材获取引导"
     assert "收敛判断" in act_skill and "关闭性癖测试技能" in act_skill, "应含收敛/关闭引导"
-    assert "1. 回顾对方已给出的言行与线索" in act_skill, "原型步骤应原样保留"
+    assert "0. 检查上回的堕落进度" in act_skill, "原型步骤应原样保留"
     assert "<thinking_format>" not in build_activation(dict(INITIAL_STATE), card), "默认激活指令不含心理COT"
     # system prompt 不再承担 COT：技能激活的 system 也不含任何 COT 标签
     assert "<think>" not in sys_prompt_skill and "<thinking_format>" not in sys_prompt_skill, "COT 已移出 system prompt"

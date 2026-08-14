@@ -3,9 +3,10 @@
 一个 LLM 驱动的桌面宠物框架：角色常驻你的电脑桌面，通过 OpenAI 兼容 API
 （DeepSeek / OpenAI / Ollama 等）驱动对话、状态演化与工具调用。
 
-**角色数据由你自备**：仓库附带原创演示角色 `character/demo/`（图书管理员精灵
-「娓娓」）用于开箱即跑；导入自己的角色卡（SillyTavern 兼容）见「角色」章节。
-仓库不包含任何第三方版权角色或游戏数据。
+**随仓库附带莫拉角色包**（`character/mora/`）：SillyTavern 角色卡
+《吾主 性典之神 莫拉》的固化版本，作者已授权按 **CC BY-NC-SA 4.0** 分发
+（见「莫拉角色包」章节）。也支持导入你自己的角色卡（SillyTavern 兼容），
+见「角色」章节。仓库不包含任何第三方游戏数据。
 
 ## 架构
 
@@ -73,9 +74,8 @@ rmgame/         RPG Maker 点评工具包（discovery/extract/wiki/monitor/cdp/o
 
 ## 角色（character/）
 
-**角色数据 = 用户自备的 SillyTavern 兼容角色卡**，程序不捆绑任何版权角色。
-仓库附带原创演示角色 `character/demo/`（图书管理员精灵「娓娓」，内容中性、
-原创、无版权关联），用于开箱即跑与自测；放入自己的角色：
+仓库附带**莫拉角色包** `character/mora/`（见下文），也支持导入你自己的
+SillyTavern 兼容角色卡。放入自己的角色：
 
 1. 把 SillyTavern 角色卡（`*.json`）命名为 `prototype/card.json`、立绘命名为
    `prototype/sprite.png`（目录自建）；
@@ -95,6 +95,20 @@ character/<slug>/
 ├── sprite.png       立绘
 └── prototype.json   原型卡副本（只读溯源）
 ```
+
+### 莫拉角色包（character/mora/）
+
+本仓库随附 **莫拉**（性典图书馆馆长 · 赫玛耐斯·莫拉）角色包，为 SillyTavern
+角色卡《吾主 性典之神 莫拉》的固化版本（card.json + identity.json +
+profile.ini + sprite.png + prototype.json）。
+
+- **创作者与版权所有者**：@.grievances、@noricika（莫拉 SillyTavern 角色卡的
+  作者），已授权随本仓库分发；
+- **分发许可**：CC BY-NC-SA 4.0（署名-非商业性使用-相同方式共享）——使用或
+  分发本角色包须保留作者署名、不得用于商业目的、演绎作品须以相同许可分发；
+  详见 `character/mora/CREDITS.md`；
+- 人设通过 `character/<slug>/` 契约注入提示词，属于角色包内容，随角色包一并
+  受 CC BY-NC-SA 4.0 约束。
 
 ### 角色内容契约（identity.json）
 
@@ -308,9 +322,11 @@ OCR 依赖：Tesseract OCR（含 `chi_sim` 语言包）+ `pip install pytesserac
 
 ## 版权与数据说明
 
-- 本仓库（代码 + 文档 + 演示角色）为 MIT 许可；演示角色「娓娓」为原创内容，
-  无第三方版权关联。
-- **角色数据自备**：`character/` 除演示角色外不入库（`.gitignore`），导入的
+- **代码与文档**：MIT License（`LICENSE`）。
+- **莫拉角色包**（`character/mora/`）：CC BY-NC-SA 4.0，创作者与版权所有者
+  @.grievances、@noricika，已授权分发；使用须署名、非商业、相同方式共享
+  （详见 `character/mora/CREDITS.md`）。
+- **用户自备角色**：`character/` 除莫拉角色包外不入库（`.gitignore`），导入的
   角色卡与人设完全由使用者负责其版权。
 - **游戏数据不入库**：`raw/`、`wiki/`、`runtime/`（含会话存档、日志）均在
   `.gitignore` 中，仓库不包含任何第三方游戏文本或衍生内容。

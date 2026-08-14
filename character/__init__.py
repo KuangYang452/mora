@@ -482,11 +482,11 @@ def current() -> CharacterData:
 # ---------------------------------------------------------------------------
 
 def selftest() -> None:
-    """契约结构自测：不依赖任何具体角色人设（1.0 起验证通用契约）。"""
+    """契约结构自测：不依赖具体角色人设（验证通用契约与角色包加载）。"""
     slugs = list_characters()
     assert slugs, "character/ 下应至少有一个角色（含 card.json 的子目录）"
-    assert "demo" in slugs, f"原创演示角色 demo 应存在，实际 {slugs}"
-    c = load_character("demo")
+    assert "mora" in slugs, f"莫拉角色 mora 应存在，实际 {slugs}"
+    c = load_character("mora")
     # 角色卡与集成元数据（不验证具体人设内容，只验证结构）
     assert c.card.get("name"), "card.json 应含 name"
     assert c.display_name and c.self_ref and c.user_ref, (c.display_name, c.self_ref, c.user_ref)
@@ -518,7 +518,7 @@ def selftest() -> None:
     cur = current()
     assert cur.slug == slugs[0], cur.slug
     set_current(c)
-    assert current().slug == "demo"
+    assert current().slug == "mora"
     print(f"[character.selftest] 通过 ✓ 角色 {len(slugs)} 个：{'、'.join(slugs)}")
 
 
