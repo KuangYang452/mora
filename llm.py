@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
 """LLM 客户端与语义化提示词 —— 桌宠角色
 
-架构约定：
-- 运行配置统一在 setting/*.ini（settings 模块，唯一配置入口）；角色数据在
-  character/<slug>/（character 包）；本模块只读不改数据文件。
-- 交付给 LLM 的提示词完全语义化：状态用自然语言叙述，不暴露代码结构。
-- LLM 一切输出都通过原生工具调用（function calling）完成：台词走 say 工具、
-  状态走 update_state 工具、查询走 rmgame/归档/笔记工具，由本模块解析；
-  旧文本 JSON 路径仅作解析容错兜底（模型未走工具时降级处理）。
-- LLM 对数据的调整权限低于硬编码：好感度只能给出 delta（趋势），
+全仓架构约定以 README「架构」八条为唯一入口；本 docstring 只声明模块内约束与
+对约定的引用，不重复约定全文：
+- 运行配置统一在 setting/*.ini（settings 模块，唯一配置入口，约定 1）；角色
+  数据在 character/<slug>/（character 包）；本模块只读不改数据文件。
+- 交付给 LLM 的提示词完全语义化（约定 5）：状态用自然语言叙述，不暴露代码
+  结构。
+- 提示词吝啬（约定 7）在本模块的落点：内容模式两处投放——【输出红线】块
+  一行（content_mode_rule）+ 激活指令首行裸标记 `内容模式:NSFW`
+  （content_mode_directive，紧邻【本回合指令】、贴近输出位置：关键规则按
+  recency 定点重复）；依赖方向（约定 8）：技能在 data.SKILLS 声明 nsfw_only，
+  开关按属性通用过滤（_mode_allowed_skills），不依赖具体技能名。
+- LLM 一切输出都通过原生工具调用（function calling，约定 6）完成：台词走
+  say 工具、状态走 update_state 工具、查询走 rmgame/归档/笔记工具，由本模块
+  解析；旧文本 JSON 路径仅作解析容错兜底（模型未走工具时降级处理）。
+- LLM 对数据的调整权限低于硬编码（约定 6）：好感度只能给出 delta（趋势），
   最终值由 data.apply_delta 结算、等级由角色 profile 映射；身份类锚点不可修改。
 - 对话历史由 pet.py 持有，经 persist.py 落盘（runtime/pet_session.json）。
 """
@@ -42,6 +49,76 @@ USER_REFERENCE = settings.user_ref()
 _CHAR = character_mod.current()
 INITIAL_STATE = _CHAR.initial_state()
 level_for = _CHAR.level_for
+
+
+# ---------------------------------------------------------------------------
+# 内容模式（NSFW / SFW）—— setting/app.ini 的 content_mode，进程启动时读取，
+# 可经 set_content_mode 运行时切换（写回 app.ini，下回合生效）。
+#
+# 投放方式与依赖方向见 README「架构」约定 7/8（本模块为实现处，不重复全文）：
+# 两处投放 = content_mode_rule（【输出红线】一行）+ content_mode_directive
+# （激活指令首行裸标记，贴近输出位置）；技能声明 nsfw_only（data.SKILLS），
+# 开关按属性通用过滤（_mode_allowed_skills），不依赖具体技能名。
+# ---------------------------------------------------------------------------
+
+def _normalize_content_mode(raw) -> str:
+    """content_mode 取值归一化：nsfw / sfw；非法值启动时直接报错（无静默兜底）。"""
+    v = str(raw or "").strip().lower()
+    if v in ("nsfw", "adult", "1", "true", "yes", "on"):
+        return "nsfw"
+    if v in ("sfw", "safe", "0", "false", "no", "off"):
+        return "sfw"
+    raise settings.ConfigError(
+        f"setting/app.ini 的 content_mode 取值非法: {raw!r}（合法值 nsfw / sfw）")
+
+
+CONTENT_MODE = _normalize_content_mode(CONFIG.get("content_mode", "nsfw"))
+
+
+def set_content_mode(mode: str) -> str:
+    """运行时切换内容模式：更新内存值并写回 setting/app.ini（文本级，保留注释）。
+
+    提示词在每回合组装时读取 CONTENT_MODE（build_system_prompt /
+    build_activation 按调用时刻取值），切换后下一回合即生效。
+    返回归一化后的模式名。
+    """
+    global CONTENT_MODE
+    new = _normalize_content_mode(mode)
+    CONTENT_MODE = new
+    settings.set_app_value("content_mode", new)
+    return new
+
+
+def _mode_allowed_skills() -> set:
+    """当前内容模式下可用的技能名集合（白名单过滤的单一来源）。
+
+    SFW 下剔除声明 nsfw_only 的技能（如角色卡的性癖分析）；NSFW 全量。
+    依赖方向：技能声明自身评级（data.SKILLS 的 nsfw_only），开关按属性
+    过滤，不依赖任何具体技能名。
+    """
+    if CONTENT_MODE == "sfw":
+        return {n for n, s in SKILLS.items() if not s.get("nsfw_only")}
+    return set(SKILLS)
+
+
+def content_mode_rule() -> str:
+    """内容模式规则行（【输出红线】块内的一行，见 build_system_prompt）。
+
+    贴合输出红线格式「- 主体：约束。」，只留可执行约束、不重复模式含义
+    （NSFW/SFW 语义由标记与模型常识承载）。
+    """
+    if CONTENT_MODE == "sfw":
+        return "- 内容模式:SFW：不允许输出。"
+    return "- 内容模式:NSFW：不允许回避。"
+
+
+def content_mode_directive() -> str:
+    """本回合内容模式裸标记：`内容模式:NSFW`，激活指令首行（紧邻【本回合指令】）。
+
+    模型有安全化倾向，贴近输出处重复强调模式（近因效应）；只写标记不赘字。
+    """
+    return "内容模式:NSFW" if CONTENT_MODE == "nsfw" else "内容模式:SFW"
+
 
 # 全局串行锁：所有 LLM 调用（回合/合并/摘要/wiki 重写）排队执行，
 # 任意时刻只有一个请求在途，后续调用阻塞等待（避免并发调用与上下文交错）。
@@ -203,7 +280,7 @@ def thinking_style_for(state: dict = None) -> str:
     （setting/llm.ini 的 reasoning → thinking.type）无关，始终注入。
     """
     state = state or {}
-    if "fetish_analysis" in (state.get("skills") or []):
+    if _mode_allowed_skills() & set(state.get("skills") or []):
         return THINKING_STYLE_INSTRUCT["logical"]
     return THINKING_STYLE_INSTRUCT["immersion"]
 
@@ -226,19 +303,23 @@ COT_ADAPT = (
 
 
 def build_activation(state: dict = None, card: dict = None) -> str:
-    """完整激活指令 = activation_instruction() [+ 心理 COT（<thinking_format> 包裹，仅激活时）]。
+    """完整激活指令 = 内容模式标记 + activation_instruction() [+ 心理 COT（<thinking_format> 包裹，仅激活时）]。
 
+    内容模式裸标记（`内容模式:NSFW`）放首行：build_messages 以「【本回合指令】\n」+
+    本返回值组装，标记因此紧邻【本回合指令】标题、贴近输出位置——模型有安全化
+    倾向，需在输出前重复强调模式（近因效应）；规则行另见【输出红线】块
+    （content_mode_rule）。
     心理 COT 内容取自原型「心理COT」世界书条目（_psych_cot），占位符已实例化；
     原型步骤后追加 COT_ADAPT（素材来源 + 收敛判断），以 <thinking_format> 标签包裹，
     明确推理只通过 think 工具记录（think 是工具循环内的推理通道——DeepSeek 工具
     调用与原生思维链互斥，工具循环内无 reasoning_content 通道），
     不写入 say 台词或其他工具参数。
     心理 COT 不依赖原生思考模式（setting/llm.ini 的 reasoning）：think 工具通道
-    始终可用，fetish_analysis 激活即注入，reasoning 开闭不影响。
+    始终可用，技能激活即注入，reasoning 开闭不影响。
     """
-    act = activation_instruction()
+    act = content_mode_directive() + "\n" + activation_instruction()
     state = state or {}
-    if "fetish_analysis" in (state.get("skills") or []) and card:
+    if card and (_mode_allowed_skills() & set(state.get("skills") or [])):
         cot_title, cot_body = _psych_cot(card)
         if cot_body:
             act += (
@@ -510,7 +591,10 @@ def mid_static_sections(state: dict = None) -> list:
         level_text = levels[cur_level]
     if level_text:
         out.append("【好感等级规则】\n" + level_text)
-    if "fetish_analysis" in (state.get("skills") or []) and skills:
+    # 已激活技能：按当前内容模式过滤后的激活技能注入对应世界书
+    # （_categorize_book 的技能条目按技能名对应；SFW 下 nsfw_only 技能已被
+    # _mode_allowed_skills 排除，残留激活状态不注入）
+    if (_mode_allowed_skills() & set(state.get("skills") or [])) and skills:
         out.append("【已激活技能】\n" + "\n\n".join(skills))
     return [_instantiate(s) for s in out]
 
@@ -633,10 +717,10 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     ContextManager.build_messages 的 pre_time 参数）；【本回合推进】由
     turn_section 生成、每轮尾部注入——避免在 system prompt 内出现高频
     变化文本而切断缓存前缀。
-    原则：
-    - 角色卡怎么写就怎么用——不删减、不改写、不做内容过滤。
-    - 状态只以语义化叙述出现（_semantic_state），LLM 看不到任何结构。
-    - 输出协议：LLM 一切输出走原生工具调用（function calling），
+    原则（引用 README「架构」约定，不重复全文）：
+    - 角色卡怎么写就怎么用——不删减、不改写、不做内容过滤（约定 8）。
+    - 状态只以语义化叙述出现（_semantic_state），LLM 看不到任何结构（约定 5）。
+    - 输出协议：LLM 一切输出走原生工具调用（function calling，约定 6），
       字段权限在提示词中语义化说明。
     - 技能注入不依赖原生思考模式（setting/llm.ini 的 reasoning）：推理通道是
       think 工具（始终可用），fetish_analysis 在激活时照常注入。
@@ -696,9 +780,13 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     # 见 tool_list_section——清单随游戏环境变化，放尾部不切缓存前缀）；
     # 清单与 function schema 同源（唯一来源 tools.SPECS），由 SPECS 派生
     # 渲染（与 API 注册的 schema 同源，不会双源不一致）。
-    listed_skills = SKILLS
+    # 技能清单：只列当前内容模式下可用的技能（SFW 下 nsfw_only 技能
+    # 自动隐藏，见 _mode_allowed_skills）
+    listed_skills = {k: v for k, v in SKILLS.items()
+                     if k in _mode_allowed_skills()}
     if not CONFIG.get("rmgame_enabled", True):
-        listed_skills = {k: v for k, v in SKILLS.items() if k != "game_context"}
+        listed_skills = {k: v for k, v in listed_skills.items()
+                         if k != "game_context"}
     skills_desc = "、".join(
         f"「{k}」({v['desc']}；{v['trigger_hint']})" for k, v in listed_skills.items())
     proto = (
@@ -758,6 +846,11 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
         "「say：xxx」之类的伪调用。\n"
         "- 工具参数只在调用时填写：不要把参数内容或旧 JSON 格式"
         "（如 {\"reply\": …}）当作文本输出。\n"
+        # 内容模式并进【输出红线】块（不单独成段）：贴合红线格式
+        # 「- 主体：约束。」只留可执行约束（NSFW：不允许回避；SFW：不允许
+        # 输出），模式含义由激活指令首行标记与模型常识承载；静态提示词
+        # 每回合重建，该行随 content_mode 翻转，切换后下一回合即生效。
+        + content_mode_rule() + "\n"
     )
     parts.append(proto)
 
@@ -875,18 +968,23 @@ def apply_state(state: dict, parsed: Reply) -> dict:
     - inner_thought：动态数据，LLM 可自主更新。
     - 等级：由数值经 data.level_for 映射，LLM 无法直接指定。
     - skills：LLM 通过工具声明的技能开关（单独变量），程序只做白名单过滤；
-      白名单不依赖原生思考模式（reasoning）：推理通道是 think 工具，始终可用，
-      fetish_analysis 可正常激活。
+      白名单不依赖原生思考模式（reasoning）：推理通道是 think 工具，始终可用；
+      白名单按当前内容模式过滤（_mode_allowed_skills：SFW 下剔除 nsfw_only
+      技能，如角色卡的性癖分析，含存档残留激活状态）。
     """
     new = dict(state)
     new["affection"] = apply_delta(int(state.get("affection", INITIAL_STATE["affection"])),
                                    parsed.affection_delta)
     if parsed.inner_thought:
         new["inner_thought"] = parsed.inner_thought[:100]
+    # 技能白名单 = data.SKILLS 定义 ∩ 当前内容模式允许（_mode_allowed_skills，
+    # SFW 下剔除 nsfw_only 技能）。未声明时保留原状态，但同样按当前模式过滤
+    # （清除 SFW 下存档残留的 nsfw_only 激活状态）。
+    allowed = _mode_allowed_skills()
     if parsed.skills is not None:
-        # 权限低于硬编码：只能激活 data.SKILLS 中定义的技能
-        allowed = set(SKILLS)
         new["skills"] = [s for s in parsed.skills if s in allowed]
+    else:
+        new["skills"] = [s for s in new.get("skills", []) if s in allowed]
     return new
 
 
@@ -1283,11 +1381,13 @@ def tool_result_text(state: dict) -> str:
         "你可以调用 say 工具说出台词结束本回合（台词与状态更新可同时调用）。"
     )
     # 显性关闭提示：技能激活是持久的，话题结束后需要 LLM 显式关闭，
-    # 避免技能残留到无关对话（性癖测试结束/离开话题时尤其需要）。
-    if "fetish_analysis" in skills:
+    # 避免技能残留到无关对话。只提示当前内容模式下仍可用的激活技能
+    # （SFW 下 nsfw_only 技能已被过滤，无残留可能，不提示）。
+    active = sorted(_mode_allowed_skills() & set(skills))
+    if active:
         text += (
-            "\n提示：性癖测试技能（fetish_analysis）仍处于激活状态。"
-            "测试结束或话题离开后，请在下次调用 update_state 时把 skills "
+            f"\n提示：技能（{'、'.join(active)}）仍处于激活状态。"
+            "话题结束或离开后，请在下次调用 update_state 时把 skills "
             "设为空数组以关闭它。"
         )
     return text
@@ -1298,6 +1398,7 @@ def tool_result_text(state: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def selftest() -> None:
+    global CONTENT_MODE   # 内容模式段会临时切到 SFW 验证再恢复（防测试污染）
     card = get_character()
     assert card.get("description", "").strip(), "角色卡描述读取失败"
 
@@ -1916,7 +2017,9 @@ def selftest() -> None:
     # 心理 COT：注入激活指令（build_activation），<thinking_format> 包裹，
     # 仅 fetish_analysis 激活；不依赖原生思考模式（reasoning）
     act_skill = build_activation({"affection": 20, "skills": ["fetish_analysis"]}, card)
-    assert act_skill.startswith(f"现在，请以{_CHAR.identity}"), "激活指令主体缺失"
+    # 内容模式裸标记在激活指令首行（紧邻【本回合指令】标题、贴近输出位置），
+    # 心理 COT 在其后、位于激活指令末尾
+    assert act_skill.startswith("内容模式:NSFW\n现在，请以" + _CHAR.identity), act_skill
     assert act_skill.rstrip().endswith("</thinking_format>"), "心理COT 应追加在激活指令末尾"
     cot_title, cot_body = _psych_cot(card)
     assert cot_title == "心理COT", cot_title   # 原型「心理COT」条目标题（去 🎁 装饰）
@@ -1968,6 +2071,76 @@ def selftest() -> None:
     assert "【已激活技能】" not in sp_any, "技能段应只在 mid_static 注入"
     assert "【已激活技能】" in "\n".join(mid_static_sections(
         {"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]}))
+
+    # ------------------------------------------------------------------
+    # 内容模式（NSFW/SFW）：【输出红线】一行（贴合红线格式）+ 激活指令首行
+    # 裸标记 + SFW 技能通用过滤（技能声明 nsfw_only，开关不依赖技能名）
+    # ------------------------------------------------------------------
+    assert CONTENT_MODE in ("nsfw", "sfw"), CONTENT_MODE
+    assert _normalize_content_mode("nsfw") == "nsfw" and _normalize_content_mode("SFW") == "sfw"
+    try:
+        _normalize_content_mode("banana")
+        raise AssertionError("非法 content_mode 应抛 ConfigError")
+    except settings.ConfigError:
+        pass
+    # 输出红线行：贴合格式「- 主体：约束。」，只留可执行约束（不重复模式含义）
+    cm_nsfw = content_mode_rule()
+    assert "- 内容模式:NSFW" in cm_nsfw and "不允许回避" in cm_nsfw, cm_nsfw
+    assert "许可成人词汇" not in cm_nsfw, "NSFW 行不应重复模式含义（NSFW 已含此义）"
+    assert "【输出红线】" in sys_prompt and "- 内容模式:NSFW" in sys_prompt, \
+        "内容模式应并入静态 system prompt 的【输出红线】块"
+    assert sys_prompt.index("【输出红线】") < sys_prompt.index("内容模式:NSFW"), \
+        "内容模式行应在【输出红线】块内"
+    # 激活指令首行裸标记：紧邻【本回合指令】（build_messages 以「【本回合指令】\n」+ 指令组装），
+    # 贴近输出位置重复强调模式（模型安全化倾向），只写标记不赘字
+    act_default = build_activation(dict(INITIAL_STATE), card)
+    assert act_default.startswith("内容模式:NSFW\n"), act_default
+    assert act_default.count("内容模式:NSFW") == 1, act_default
+    # 依赖方向：技能声明自身评级（data.SKILLS 的 nsfw_only），开关逻辑不依赖
+    # 任何具体技能名（模式相关文本不含技能名）
+    assert SKILLS["fetish_analysis"].get("nsfw_only") is True, "性癖分析应声明仅 NSFW 可用"
+    assert not SKILLS["game_context"].get("nsfw_only"), "game_context 不应声明 nsfw_only"
+    assert "fetish_analysis" not in content_mode_rule() and \
+        "fetish_analysis" not in content_mode_directive(), "开关逻辑不应依赖具体技能名"
+    # SFW 模式：规则行翻转 + 通用过滤（白名单/注入/思维风格/心理COT 全链路禁用 nsfw_only 技能）
+    _saved_mode = CONTENT_MODE
+    try:
+        CONTENT_MODE = "sfw"
+        cm_sfw = content_mode_rule()
+        assert cm_sfw != cm_nsfw and "- 内容模式:SFW" in cm_sfw and "不允许输出" in cm_sfw, cm_sfw
+        assert "禁止成人词汇" not in cm_sfw, "SFW 行不应重复模式含义（SFW 已含此义）"
+        assert _mode_allowed_skills() == {"game_context"}, _mode_allowed_skills()
+        # 白名单：声明 fetish_analysis 被剔除（含存档残留）
+        st_sfw = apply_state({"affection": 20, "inner_thought": "x",
+                              "skills": ["fetish_analysis"]},
+                             parse_llm_reply('{"reply": "x", "skills": ["fetish_analysis"]}'))
+        assert st_sfw["skills"] == [], st_sfw
+        # 半动态注入：残留激活不注入性癖分析世界书
+        assert "【已激活技能】" not in "\n".join(mid_static_sections(
+            {"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]}))
+        # 思维链风格：回落角色沉浸式；心理 COT：不再注入
+        assert thinking_style_for({"skills": ["fetish_analysis"]}) == \
+            THINKING_STYLE_INSTRUCT["immersion"], "SFW 下应回落沉浸式"
+        assert "<thinking_format>" not in build_activation(
+            {"affection": 20, "skills": ["fetish_analysis"]}, card), "SFW 下不应注入心理COT"
+        # 静态提示词：技能清单不再列出性癖分析（角色卡原文如身份自述保留——
+        # 「角色卡怎么写就怎么用」原则，SFW 规则约束的是输出通道而非卡面内容）
+        sp_sfw = build_system_prompt(card, state={"affection": 20, "inner_thought": "x",
+                                                  "skills": ["fetish_analysis"]})
+        assert "- 内容模式:SFW" in sp_sfw and "不允许输出" in sp_sfw, sp_sfw
+        assert "「fetish_analysis」" not in sp_sfw, "SFW 下技能清单不应列出性癖分析技能"
+        # 激活指令首行裸标记翻转
+        act_sfw = build_activation(dict(INITIAL_STATE), card)
+        assert act_sfw.startswith("内容模式:SFW\n"), act_sfw
+        # 工具结果回显：SFW 下无 nsfw_only 技能关闭提示
+        assert "性癖分析" not in tool_result_text(
+            {"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]})
+    finally:
+        CONTENT_MODE = _saved_mode
+    # 恢复后 NSFW 链路可用（防测试污染）
+    assert _mode_allowed_skills() == set(SKILLS) and "「fetish_analysis」" in build_system_prompt(
+        card, state=dict(INITIAL_STATE))
+
     # 动态尾部段（移出 system prompt）：状态/环境/工具清单/推进由独立函数生成
     ts1 = turn_section((1, 4))
     assert ts1 and "【本回合推进】" in ts1 and "最多可自主推进 4 轮" in ts1, ts1

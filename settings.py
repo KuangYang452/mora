@@ -14,17 +14,19 @@ character 包加载，不经过本模块。
   Path(__file__).resolve().parent / "xxx"；
 - ini 解析使用 RawConfigParser（不做 % 插值，避免台词中的 % 被吞）；
 - LLM 配置缺失必填字段（base_url/api_key/model）时抛 ConfigError，
-  不静默兜底（延续原架构约定）。
+  不静默兜底（README「架构」约定 2）。
 """
 
 import configparser
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SETTING_DIR = ROOT / "setting"
 
-# 版本号唯一事实来源（语义化版本 MAJOR.MINOR.PATCH，见 docs/VERSIONING.md）：
-# 发布流程 = 全量自测 → CHANGELOG.md 归档 → 更新本常量 → 提交 → git tag v<版本>。
+# 版本号唯一事实来源（语义化版本 MAJOR.MINOR.PATCH，规范见 README
+# 「版本与发布」附录）：发布流程 = 全量自测 → CHANGELOG.md 归档 → 更新本常量
+# → 提交 → git tag v<版本>。
 VERSION = "1.1.0"
 
 
@@ -198,3 +200,47 @@ def user_ref() -> str:
     cp = _read_ini("user.ini", inline=True)
     val = _get(cp, "user", "ref", "对方")
     return str(val or "对方").strip() or "对方"
+
+
+# ---------------------------------------------------------------------------
+# 运行时写回（文本级键值替换，保留注释）
+# ---------------------------------------------------------------------------
+
+def set_app_value(key: str, value: str) -> None:
+    """写回 setting/app.ini 的 [app] 节键值（文本级替换，保留行内注释）。
+
+    供运行时开关（如内容模式切换）使用：configparser 写回会丢弃注释，
+    故沿用 launcher 同款文本替换（值中不出现 ; / # —— app.ini 的解析
+    本就将其视为行内注释，读写一致）。键不存在时在节尾追加；
+    app.ini 缺失时抛 ConfigError（README「架构」约定 2：无兜底默认，缺失即报错）。
+    """
+    path = SETTING_DIR / "app.ini"
+    if not path.exists():
+        raise ConfigError("缺少配置文件: app.ini，请从 setting/app.ini.example 复制")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    sec_idx = next((i for i, ln in enumerate(lines)
+                    if re.match(r"^\s*\[app\]\s*$", ln)), None)
+    if sec_idx is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("[app]")
+        lines.append(f"{key} = {value}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+    end = len(lines)
+    for i in range(sec_idx + 1, len(lines)):
+        if re.match(r"^\s*\[", lines[i]):
+            end = i
+            break
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.*)$")
+    for i in range(sec_idx + 1, end):
+        m = key_re.match(lines[i])
+        if m:
+            rest = m.group(1)
+            cm = re.search(r"\s*[;#].*$", rest)
+            comment = cm.group(0) if cm else ""
+            lines[i] = f"{key} = {value}{comment}"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return
+    lines.insert(end, f"{key} = {value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
