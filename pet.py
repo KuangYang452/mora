@@ -30,9 +30,11 @@ import logutil
 import persist
 import tools
 
-# 运行配置（setting/app.ini）与用户指称（setting/user.ini）快照：
-# 进程启动时从唯一配置入口读取一次，运行期不变。
-CONFIG = settings.app_config()
+# 用户指称（setting/user.ini）：进程启动时读取一次，运行期不变。
+# 运行配置：启动期键（外观/行为/上下文窗口）在 __init__ 读一次存入
+# self._cfg 快照（运行期不变）；运行期热键经 settings.app_get 读取
+# （M3 配置分层，见 docs/REFACTOR_DESIGN.md §6——功能开关修改后
+# 下回合生效、无需重启）。
 USER_REFERENCE = settings.user_ref()
 from llm import (
     ChatError,
@@ -87,10 +89,10 @@ _TOOL_STATUS = {
 # 查询类工具（意向-动作校验判定：说了要查但没调这些 → 触发重试）
 # 与游戏世界类工具（<game_data> 包裹回传）均派生自 tools.SPECS 注册表
 # （唯一来源，见 tools.query_names / tools.game_world_names）。
-_QUERY_TOOL_NAMES = tools.query_names(
-    rmgame_enabled=CONFIG.get("rmgame_enabled", True))
-_GAME_TOOL_NAMES = tools.game_world_names(
-    rmgame_enabled=CONFIG.get("rmgame_enabled", True))
+# 取全量集合（rmgame_enabled=True）：rmgame 工具未注册时模型不会调用它们，
+# 全量集合对校验/包裹判定与按开关过滤等价，且不随运行期开关变化而失效。
+_QUERY_TOOL_NAMES = tools.query_names()
+_GAME_TOOL_NAMES = tools.game_world_names()
 # 查询限一校验（防批量查询撑爆结果区预算）：每轮最多一个**大结果**查询
 # 工具（结果可能很大的查询；discover_running 只返回小名称列表，不计入）。
 # 隐性篇幅上限 = 两次查询结果之和（保留最近两轮、不截断），见 _request_llm。
@@ -179,7 +181,10 @@ class MoraPet:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.char = character_mod.current()   # 当前激活角色（character/<slug>/）
-        self.scale = float(CONFIG.get("scale", 0.6))
+        # 启动期配置快照（唯一配置入口 settings：外观/行为/上下文窗口等，
+        # 运行期不变；运行期热键经 settings.app_get 读取）
+        self._cfg = settings.app_config()
+        self.scale = float(self._cfg.get("scale", 0.6))
         self.speech_color = self.char.speech_color
 
         self.card = get_character()      # 角色卡（card.json，不依赖原型）
@@ -187,15 +192,15 @@ class MoraPet:
         # 持久化恢复：有存档 → 恢复状态（只取已知键）与对话历史（含 time）；
         # 无存档 → 初始状态 + 开场白台词作为上下文文本流的起始
         saved = persist.load_session()
-        keep_recent = int(CONFIG.get("context_keep_recent", 10))
-        keep_mid = int(CONFIG.get("context_keep_mid", 20))
+        keep_recent = int(self._cfg.get("context_keep_recent", 10))
+        keep_mid = int(self._cfg.get("context_keep_mid", 20))
         initial_state = self.char.initial_state()
         if saved:
             st = saved.get("state") or {}
             self.state = dict(initial_state)
             self.state.update({k: v for k, v in st.items() if k in initial_state})
             self.ctx = ContextManager(
-                rounds=int(CONFIG.get("history_rounds", 30)),
+                rounds=int(self._cfg.get("history_rounds", 30)),
                 keep_recent=keep_recent, keep_mid=keep_mid)
             self.ctx.history = [
                 m for m in saved.get("history") or []
@@ -207,7 +212,7 @@ class MoraPet:
         else:
             self.state = dict(initial_state)
             self.ctx = ContextManager(
-                rounds=int(CONFIG.get("history_rounds", 30)), opening=opening,
+                rounds=int(self._cfg.get("history_rounds", 30)), opening=opening,
                 keep_recent=keep_recent, keep_mid=keep_mid)
             self._resume_gap = None
             self._fresh_session = True   # 无存档：首次会话 → 开场白作为问候气泡展示
@@ -249,7 +254,7 @@ class MoraPet:
         self._monitor_thread = None
         self._maybe_start_monitor()
         # 启动问候：延迟到窗口就绪后调用 LLM 生成开场白
-        if CONFIG.get("greet_on_start", True):
+        if self._cfg.get("greet_on_start", True):
             self.root.after(1200, self._greet)
 
     def _install_exception_hooks(self):
@@ -296,14 +301,14 @@ class MoraPet:
         （鸡生蛋问题）。monitor_loop_all 每轮重读 games.json 并自行
         执行自动发现，传入的空列表只作占位。
         """
-        if not CONFIG.get("rmgame_enabled", True) \
-                or not CONFIG.get("monitor_auto_start", True):
+        if not settings.app_get("rmgame_enabled", True) \
+                or not settings.app_get("monitor_auto_start", True):
             return
         try:
             games = rmgame_facade.games()
         except Exception:
             return
-        interval = float(CONFIG.get("rmgame_monitor_interval", 2.0))
+        interval = float(settings.app_get("rmgame_monitor_interval", 2.0))
 
         def _guard():
             try:
@@ -324,12 +329,12 @@ class MoraPet:
 
         回调在守护线程内调用，经 root.after 调度回主线程（tkinter 非线程安全）；
         仅首次自动入库触发（auto_register 幂等）。开关
-        CONFIG["rmgame_confirm_bubble"] 关闭时只保留右键菜单入口。
+        rmgame_confirm_bubble（settings.app_get 热读）关闭时只保留右键菜单入口。
         """
         slug = getattr(info, "slug", "")
         if not slug:
             return
-        if not CONFIG.get("rmgame_confirm_bubble", True):
+        if not settings.app_get("rmgame_confirm_bubble", True):
             return
         try:
             self.root.after(0, lambda: self._show_approve_bubble(slug))
@@ -582,7 +587,7 @@ class MoraPet:
         except Exception as exc:
             self._bubble_text(f"切换内容模式失败：{exc}", fg="#c0392b", bg="#f4efe6")
             return
-        CONFIG["content_mode"] = new
+        # set_content_mode 已写回 app.ini 并更新 CONTENT_MODE（下回合生效）
         if new == "nsfw":
             text = "已切换为「🔞 NSFW」内容模式：许可成人词汇，不得回避。下回合生效。"
         else:
@@ -637,11 +642,11 @@ class MoraPet:
         """读取游戏环境快照（新鲜度过滤）；无有效快照返回 None。
 
         数据源：rmgame monitor 写入的 runtime/current.json；
-        阈值 CONFIG["rmgame_env_fresh_seconds"]（<=0 或开关关闭 = 不注入）。
+        阈值 rmgame_env_fresh_seconds（settings.app_get 热读；<=0 或开关关闭 = 不注入）。
         """
         try:
-            fresh = float(CONFIG.get("rmgame_env_fresh_seconds", 300))
-            if fresh <= 0 or not CONFIG.get("rmgame_enabled", True):
+            fresh = float(settings.app_get("rmgame_env_fresh_seconds", 300))
+            if fresh <= 0 or not settings.app_get("rmgame_enabled", True):
                 return None
             cur = rmgame_facade.snapshot()
         except Exception:
@@ -747,7 +752,7 @@ class MoraPet:
         多轮循环内第 2 轮起整段前缀可命中缓存，只支付每轮增量成本。
         所有 UI 操作经 root.after 调度回主线程（tkinter 非线程安全）。
         """
-        max_turns = max(1, int(CONFIG.get("agent_max_turns", 4)))
+        max_turns = max(1, int(self._cfg.get("agent_max_turns", 4)))
         self._summary_pending = set()   # 本回合摘要触发去重（生成失败下回合重试）
         self._think_chain = ""          # 本回合累积思路链（每轮追加，块不闭合）
         self._queried_before = False    # 本回合是否已调过查询工具（意向-动作校验）
@@ -816,7 +821,7 @@ class MoraPet:
                 # 意向-动作校验（防"说了要查却只演翻书"）：台词出现查询意向
                 # 且本回合此前未查过、本子轮也未调任何查询工具 → 追加修复指令重试一次。
                 # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归校验。
-                if (CONFIG.get("retry_on_vague_query", False)
+                if (settings.app_get("retry_on_vague_query", False)
                         and not retried_this_turn
                         and (env or {}).get("game")
                         and not queried_before
@@ -851,7 +856,7 @@ class MoraPet:
                 # 模型决定收尾却没走 say 通道，追加修复指令重试一次强制引导。
                 # 首轮 content 直出（agent_msgs 为空）是合法降级路径，不重试；
                 # 防死循环：每子轮最多重试 1 次，重试结果无条件接受，不递归校验。
-                if (CONFIG.get("force_say_to_finish", False)
+                if (settings.app_get("force_say_to_finish", False)
                         and not retried_this_turn
                         and agent_msgs
                         and not calls
@@ -908,7 +913,7 @@ class MoraPet:
                 # （快照/词条均未变化），think 结论每轮重写——查询结果只保留
                 # 最近两轮，think 轮后更早结果已从上下文移除，模型被迫重查。
                 # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
-                if (CONFIG.get("retry_on_repeated_query", True)
+                if (settings.app_get("retry_on_repeated_query", True)
                         and not retried_this_turn
                         and self._queried_count >= 1
                         and any(c["name"] in _QUERY_TOOL_NAMES
@@ -941,7 +946,7 @@ class MoraPet:
                 # 结果区隐性预算 = 保留两轮（两轮查询结果之和，结果不截断），
                 # 用数量换可预期性（见 _QUERY_LIMIT_NAMES 注释）。
                 # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
-                if (CONFIG.get("retry_on_multi_query", True)
+                if (settings.app_get("retry_on_multi_query", True)
                         and not retried_this_turn
                         and sum(1 for c in calls
                                 if c["name"] in _QUERY_LIMIT_NAMES) >= 2):
@@ -1187,9 +1192,9 @@ class MoraPet:
         防呆：绝对下限 300ms、上限不低于下限 —— 即使个别配置解析异常
         （曾因秒类配置误归整数表回退 0），气泡也不会瞬间消失。
         """
-        min_ms = max(300, int(float(CONFIG.get("bubble_min_seconds", 3.0)) * 1000))
-        max_ms = max(min_ms, int(float(CONFIG.get("bubble_max_seconds", 15.0)) * 1000))
-        read_ms = max(0, float(CONFIG.get("bubble_read_ms_per_char", 70)))
+        min_ms = max(300, int(float(self._cfg.get("bubble_min_seconds", 3.0)) * 1000))
+        max_ms = max(min_ms, int(float(self._cfg.get("bubble_max_seconds", 15.0)) * 1000))
+        read_ms = max(0, float(self._cfg.get("bubble_read_ms_per_char", 70)))
         return max(int(min_ms), min(int(max_ms), int(text_len * read_ms)))
 
     def _fade_to(self, target: float, ms: int, on_done=None):
@@ -1293,8 +1298,8 @@ class MoraPet:
         tail_h = 10
         w = min(BUBBLE_MAX_W, max(fnt.measure(line) for line in lines) + pad_x * 2)
         h = len(lines) * lh + pad_y * 2 + tail_h
-        shadow = int(CONFIG.get("bubble_shadow", 3))
-        corner = int(CONFIG.get("bubble_corner", 14))
+        shadow = int(self._cfg.get("bubble_shadow", 3))
+        corner = int(self._cfg.get("bubble_corner", 14))
         self._bubble_canvas.configure(width=w + shadow, height=h + shadow)
         # 阴影：先画偏移的深色圆角矩形（放在正文下层）
         if shadow > 0:
@@ -1325,7 +1330,7 @@ class MoraPet:
             self._bubble.attributes("-alpha", 0.0)
         except Exception:
             pass
-        self._fade_to(1.0, int(CONFIG.get("bubble_fade_ms", 150)))
+        self._fade_to(1.0, int(self._cfg.get("bubble_fade_ms", 150)))
 
     def _rounded_rect(self, x1, y1, x2, y2, r, cv=None, **kw):
         """canvas 圆角矩形（smooth 多边形近似），r 为圆角半径。
@@ -1352,9 +1357,9 @@ class MoraPet:
             for i in range(len(lines))
         ]
         self._tw_state = {"lines": lines, "items": items, "li": 0, "ci": 0}
-        type_ms = int(CONFIG.get("bubble_type_ms", 18))
-        pause_chars = set(CONFIG.get("bubble_pause_chars", "。！？…，；：、."))
-        pause_ms = int(CONFIG.get("bubble_pause_ms", 160))
+        type_ms = int(self._cfg.get("bubble_type_ms", 18))
+        pause_chars = set(self._cfg.get("bubble_pause_chars", "。！？…，；：、."))
+        pause_ms = int(self._cfg.get("bubble_pause_ms", 160))
         cursor = "▍"   # 打字光标（行尾竖条）
 
         def step():
@@ -1402,7 +1407,7 @@ class MoraPet:
         if self._bubble_timer is not None:
             self._bubble_timer = None
         self._bubble_phase = "fade_out"
-        fade_ms = int(CONFIG.get("bubble_fade_ms", 150))
+        fade_ms = int(self._cfg.get("bubble_fade_ms", 150))
         self._fade_to(0.0, fade_ms, on_done=self._dismiss_bubble)
 
     def _wrap(self, text: str, fnt) -> list:
@@ -1438,7 +1443,7 @@ class MoraPet:
     # ------------------------------------------------------------------ 动画
 
     def _idle_loop(self):
-        if CONFIG.get("idle_bob", True) and not self._busy:
+        if self._cfg.get("idle_bob", True) and not self._busy:
             dy = round(math.sin(self._bob_phase) * 5)
             x = self.root.winfo_x()
             self.root.geometry(f"+{x}+{self._bob_base_y + dy}")
@@ -1473,7 +1478,7 @@ class MoraPet:
         又触发"；fire 还带保护窗口（auto_chat_min_gap_seconds 内跳过）。
         0 = 关闭。
         """
-        self._idle_interval = float(CONFIG.get("auto_chat_minutes", 10) or 0)
+        self._idle_interval = float(self._cfg.get("auto_chat_minutes", 10) or 0)
         if self._idle_interval <= 0:
             return
         self._auto_chat_after = None
@@ -1484,13 +1489,13 @@ class MoraPet:
         """按当前间隔排定闲置闲聊检查（fire 自递归；可被对方互动重排）。"""
         def fire():
             self._auto_chat_after = None
-            min_gap = float(CONFIG.get("auto_chat_min_gap_seconds", 60))
+            min_gap = float(self._cfg.get("auto_chat_min_gap_seconds", 60))
             if (not self._busy
                     and time.monotonic() - self._last_user_at >= min_gap):
                 self._auto_chat()
                 # 闲置触发成功后间隔递增（对方没操作 → 越来越疏）
-                growth = float(CONFIG.get("auto_chat_growth", 2.0))
-                max_min = float(CONFIG.get("auto_chat_max_minutes", 2880))
+                growth = float(self._cfg.get("auto_chat_growth", 2.0))
+                max_min = float(self._cfg.get("auto_chat_max_minutes", 2880))
                 self._idle_interval = min(self._idle_interval * growth, max_min)
             self._auto_chat_after = self.root.after(
                 int(self._idle_interval * 60 * 1000), fire)
@@ -1505,8 +1510,8 @@ class MoraPet:
         避免"对方刚互动完又恰巧触发闲置激活"；同时记录互动时刻
         供 fire 的保护窗口判断。
         """
-        initial = float(CONFIG.get("auto_chat_minutes", 10) or 0)
-        growth = float(CONFIG.get("auto_chat_growth", 2.0))
+        initial = float(self._cfg.get("auto_chat_minutes", 10) or 0)
+        growth = float(self._cfg.get("auto_chat_growth", 2.0))
         self._idle_interval = max(initial, self._idle_interval / growth)
         self._last_user_at = time.monotonic()
         if getattr(self, "_auto_chat_after", None) is not None:
@@ -1524,7 +1529,7 @@ class MoraPet:
         开场白同时是上下文起始（opening），气泡展示与历史一致；
         问候台词会留在对话历史中，作为后续对话的上下文起点。
         """
-        if not CONFIG.get("greet_on_start", True) or self._busy:
+        if not self._cfg.get("greet_on_start", True) or self._busy:
             return
         opening = self.char.opening if getattr(self, "_fresh_session", False) else []
         for line in opening[:6]:
