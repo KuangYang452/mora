@@ -4,7 +4,7 @@
 全部 LLM 工具的唯一注册处（1.0 起，见 docs/1.0_RELEASE_PLAN.md §5.4）：
 - ToolSpec 聚合：工具名 / 语义化描述 / 原生 function schema / 分类标记
   （is_query 查询类 → 意向-动作校验；is_game_world 游戏世界类 →
-  <game_data> 包裹）/ rmgame 标记（受 CONFIG["rmgame_enabled"] 开关）。
+  <game_data> 包裹）/ rmgame 标记（受 settings.app_get("rmgame_enabled") 开关）。
 
 派生关系（消除手工同步点）：
 - llm._build_tools()         → schema_list()（API 注册）

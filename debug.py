@@ -71,7 +71,7 @@ def print_state() -> None:
     for lo, hi, name in char.affection_levels:
         print(f"  {lo:>3} ~ {hi:>3}  {name}")
     print(f"单回合好感度变化边界: ±{AFFECTION_MAX_DELTA}")
-    print(f"日志开关: log_enabled = {settings.app_config().get('log_enabled', True)}")
+    print(f"日志开关: log_enabled = {settings.app_get('log_enabled', True)}")
 
 
 def print_log_list() -> None:

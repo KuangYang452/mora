@@ -26,8 +26,9 @@ import settings
 # 每个子进程新建控制台窗口（一闪而过）；统一加 CREATE_NO_WINDOW 抑制。
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# 运行配置快照（setting/app.ini，唯一配置入口；CDP/监控开关等）
-CONFIG = settings.app_config()
+# 运行配置热键经 settings.app_get 运行期读取（M3 配置分层，见
+# docs/REFACTOR_DESIGN.md §6：cdp/nwjs/auto_discover 修改后即时生效）；
+# 不再持有模块级启动期快照。
 
 CURRENT_FILE = RUNTIME_DIR / "current.json"
 
@@ -194,7 +195,7 @@ def start_game(game: GameInfo, port: int = None,
     返回：{"state": "running"|"would_start"|"started", "port", "pid", "mode"}。
     """
     port = port or port_for(game.slug)
-    cdp_enabled = CONFIG.get("rmgame_cdp_enabled", True)
+    cdp_enabled = settings.app_get("rmgame_cdp_enabled", True)
     if not cdp_enabled:
         # CDP 开关关闭：普通启动，实时读取走 OCR
         cmd = [game.exe_path]
@@ -244,8 +245,9 @@ def start_game(game: GameInfo, port: int = None,
 
 
 def _nwjs_sdk_exe() -> str or None:
-    """定位 nwjs SDK 的 nw.exe：CONFIG 指定优先，否则探测 %TEMP%\\nwjs-sdk-*。"""
-    cfg = str(CONFIG.get("rmgame_nwjs_sdk") or "").strip()
+    """定位 nwjs SDK 的 nw.exe：app.ini 的 rmgame_nwjs_sdk 指定优先，否则探测
+    %TEMP%\\nwjs-sdk-*。"""
+    cfg = str(settings.app_get("rmgame_nwjs_sdk") or "").strip()
     if cfg and Path(cfg).exists():
         return cfg
     try:
@@ -327,7 +329,7 @@ def read_state(game: GameInfo, port: int = None, evaluator=None,
     """
     port = port or port_for(game.slug)
     # CDP 开关关闭（游戏拒绝调试参数时）→ 跳过 CDP 直接 OCR
-    cdp_enabled = CONFIG.get("rmgame_cdp_enabled", True)
+    cdp_enabled = settings.app_get("rmgame_cdp_enabled", True)
     if not ocr_only and cdp_enabled:
         try:
             if evaluator is not None:
@@ -595,7 +597,7 @@ def monitor_loop_all(games, interval: float = 2.0, stop_event=None,
     （enumerate_running），用实际调试端口连接；进程表中无该游戏时
     回退 port_for 默认端口。
 
-    自动发现（CONFIG["rmgame_auto_discover"]=True）：同一轮枚举中识别出
+    自动发现（app.ini 的 rmgame_auto_discover，settings.app_get 热读）：同一轮枚举中识别出
     运行中的未注册 RPG Maker 游戏 → auto_register 自动入库（trust=auto，
     只读能力，禁启动）；轮询列表每轮动态刷新（load_games），新入库游戏
     即时纳入监控。首次自动入库的游戏经 on_auto_register 回调通知
@@ -612,7 +614,7 @@ def monitor_loop_all(games, interval: float = 2.0, stop_event=None,
     ports = {}
     prev_events = {}   # slug -> 上次事件标识（摘要生成去重）
     fail_retry = {}    # slug -> 距下次重试的剩余轮数（读取失败降频）
-    auto_discover = bool(CONFIG.get("rmgame_auto_discover", True))
+    auto_discover = bool(settings.app_get("rmgame_auto_discover", True))
     from .discovery import load_games
     while (max_rounds is None or rounds < max_rounds) \
             and not (stop_event is not None and stop_event.is_set()):

@@ -181,7 +181,7 @@ def _snapshot_age_note(cur: dict) -> str:
     try:
         import settings
         from datetime import datetime
-        fresh = float(settings.app_config().get("rmgame_env_fresh_seconds", 300))
+        fresh = float(settings.app_get("rmgame_env_fresh_seconds", 300))
         ts = cur.get("read_at") or cur.get("updated_at") or ""
         age = (datetime.now() - datetime.fromisoformat(ts)).total_seconds()
     except Exception:

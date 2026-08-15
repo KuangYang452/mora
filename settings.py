@@ -14,7 +14,11 @@ character 包加载，不经过本模块。
   Path(__file__).resolve().parent / "xxx"；
 - ini 解析使用 RawConfigParser（不做 % 插值，避免台词中的 % 被吞）；
 - LLM 配置缺失必填字段（base_url/api_key/model）时抛 ConfigError，
-  不静默兜底（README「架构」约定 2）。
+  不静默兜底（README「架构」约定 2）；
+- 运行期热读（M3 配置分层，见 docs/REFACTOR_DESIGN.md §6）：功能开关类
+  键（content_mode / tool_choice / log_enabled / rmgame_* / retry_* 等）
+  经 app_get 读取（白名单 + mtime 缓存），修改 app.ini 后无需重启；
+  启动期冻结键（外观/行为/上下文窗口）由调用方启动时经 app_config 读取一次。
 """
 
 import configparser
@@ -74,6 +78,7 @@ _FLOAT_KEYS = {
 _BOOL_KEYS = {
     "idle_bob", "greet_on_start", "speech_as_tool",
     "retry_on_vague_query", "force_say_to_finish", "mesugaki_style_block",
+    "retry_on_repeated_query", "retry_on_multi_query",
     "rmgame_enabled", "rmgame_cdp_enabled", "monitor_auto_start",
     "rmgame_auto_discover", "rmgame_confirm_bubble",
     "log_enabled",
@@ -244,3 +249,115 @@ def set_app_value(key: str, value: str) -> None:
             return
     lines.insert(end, f"{key} = {value}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 运行期热读（M3 配置分层，见 docs/REFACTOR_DESIGN.md §6）
+# ---------------------------------------------------------------------------
+
+# 运行期热读键白名单：影响回合行为/功能开关的键，修改 setting/app.ini 后
+# 无需重启、下次读取即生效。白名单之外的键是**启动期冻结配置**（外观/行为/
+# 上下文窗口等），由调用方在进程启动时读取一次（pet 存 self._cfg 快照）——
+# 不得经 app_get 读取，误用会退化为「改了不生效」的旧语义（README「架构」
+# 约定 2 精神：错误即报错）。
+_HOT_KEYS = frozenset({
+    "content_mode", "tool_choice", "log_enabled", "mesugaki_style_block",
+    "retry_on_vague_query", "force_say_to_finish",
+    "retry_on_repeated_query", "retry_on_multi_query",
+    "rmgame_enabled", "rmgame_cdp_enabled", "rmgame_confirm_bubble",
+    "monitor_auto_start", "rmgame_monitor_interval",
+    "rmgame_auto_discover", "rmgame_nwjs_sdk", "rmgame_env_fresh_seconds",
+})
+
+# mtime 缓存：app.ini 未变时复用解析结果（热路径免重复读盘解析）；
+# set_app_value / 外部编辑都会改变 mtime，自动失效。
+_app_cache = {"mtime": None, "data": None}
+
+# 临时覆盖（离线自测用，app_get 优先读取；调用方负责恢复）
+_OVERRIDES: dict = {}
+
+
+def _cached_app() -> dict:
+    """app.ini [app] 节解析结果（mtime 缓存；文件缺失返回空 dict）。"""
+    p = SETTING_DIR / "app.ini"
+    try:
+        mtime = p.stat().st_mtime_ns
+    except OSError:
+        mtime = None
+    if _app_cache["data"] is not None and _app_cache["mtime"] == mtime:
+        return _app_cache["data"]
+    cp = _read_ini("app.ini", inline=True)
+    out = {}
+    if cp.has_section("app"):
+        for key, val in cp.items("app"):
+            out[key] = _conv(key, val)
+    _app_cache["mtime"] = mtime
+    _app_cache["data"] = out
+    return out
+
+
+def override(key: str, value):
+    """临时覆盖热读键（离线自测用）；恢复 = 覆盖回原值或 clear_overrides。"""
+    if key not in _HOT_KEYS:
+        raise ConfigError(f"app.ini 键 {key!r} 不在运行期热读白名单，不能覆盖")
+    _OVERRIDES[key] = value
+
+
+def clear_overrides() -> None:
+    _OVERRIDES.clear()
+
+
+def app_get(key: str, default=None):
+    """运行期热读 setting/app.ini 的 [app] 键（mtime 缓存）。
+
+    仅白名单热键可读（白名单之外为启动期冻结配置，启动时读取一次）；
+    文件缺失/键缺失返回 default（与 app_config 语义一致）。
+    """
+    if key not in _HOT_KEYS:
+        raise ConfigError(
+            f"app.ini 键 {key!r} 不在运行期热读白名单（启动期配置请在启动时"
+            "读取一次，见 docs/REFACTOR_DESIGN.md §6）")
+    if key in _OVERRIDES:
+        return _OVERRIDES[key]
+    return _cached_app().get(key, default)
+
+
+# ---------------------------------------------------------------------------
+# 离线自测
+# ---------------------------------------------------------------------------
+
+def selftest() -> None:
+    # 白名单约束：启动期键拒绝热读（错误即报错，防误用退化为"改了不生效"）
+    try:
+        app_get("scale", 0.6)
+        raise AssertionError("scale 为启动期键，不应经 app_get 读取")
+    except ConfigError:
+        pass
+    # 热键可读；文件缺失/键缺失返回默认（真实 app.ini 存在与否均可自测）
+    assert app_get("rmgame_enabled", True) in (True, False)
+    # 白名单内但 app.ini 未配置的键 → 返回默认（空值字符串或 None 均可）
+    nwjs = app_get("rmgame_nwjs_sdk", None)
+    assert nwjs is None or isinstance(nwjs, str)
+    # override 生效与恢复
+    assert app_get("tool_choice", "auto") in ("required", "auto", None)
+    settings_saved = app_get("tool_choice", "auto")
+    try:
+        override("tool_choice", "auto")
+        assert app_get("tool_choice", "auto") == "auto"
+    finally:
+        clear_overrides()
+        assert app_get("tool_choice", "auto") == settings_saved or settings_saved is None
+    # 类型还原表（含 1.2 新增的重复查询布尔键）
+    assert _conv("history_rounds", "30") == 30
+    assert _conv("rmgame_monitor_interval", "3.0") == 3.0
+    assert _conv("log_enabled", "false") is False
+    assert _conv("retry_on_repeated_query", "false") is False, "重复查询开关应布尔还原"
+    assert _conv("retry_on_multi_query", "false") is False, "多查询开关应布尔还原"
+    assert _conv("content_mode", "nsfw") == "nsfw"
+    # mtime 缓存：连续读取返回同一 dict 对象（缓存命中）
+    assert _cached_app() is _cached_app()
+    print("[settings.selftest] 通过 ✓ app_get 热读 / 白名单约束 / override / 类型还原 / mtime 缓存")
+
+
+if __name__ == "__main__":
+    selftest()

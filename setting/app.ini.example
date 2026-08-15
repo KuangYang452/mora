@@ -4,7 +4,11 @@
 
 [app]
 ; ---- 外观 ----
-; 注意：本文件修改后需重启桌宠生效（配置在启动时读取一次）
+; 注意：本节的启动期配置（外观/动画/上下文窗口/闲聊节奏等）在启动时读取
+; 一次，修改后需重启桌宠生效；功能开关类运行期配置（content_mode /
+; tool_choice / log_enabled / rmgame_* / retry_* 等）经 settings.app_get
+; 热读，修改后下回合/下次读取即生效、无需重启（M3 配置分层，
+; 见 docs/REFACTOR_DESIGN.md §6）。
 scale = 0.6                 ; 立绘缩放
 idle_bob = true             ; 呼吸浮动动画
 bubble_min_seconds = 10.0    ; 气泡最短停留时间（秒）

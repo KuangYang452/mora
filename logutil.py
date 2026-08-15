@@ -22,7 +22,7 @@ _PREFIX = "round_"
 
 
 def is_enabled() -> bool:
-    return bool(settings.app_config().get("log_enabled", True))
+    return bool(settings.app_get("log_enabled", True))
 
 
 def _ensure_dir() -> Path:
