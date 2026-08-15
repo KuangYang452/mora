@@ -31,7 +31,7 @@ SETTING_DIR = ROOT / "setting"
 # 版本号唯一事实来源（语义化版本 MAJOR.MINOR.PATCH，规范见 README
 # 「版本与发布」附录）：发布流程 = 全量自测 → CHANGELOG.md 归档 → 更新本常量
 # → 提交 → git tag v<版本>。
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 
 
 class ConfigError(Exception):

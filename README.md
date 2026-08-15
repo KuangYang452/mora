@@ -1,6 +1,6 @@
-# LLM 桌面宠物框架（桌宠莫拉 v1.1.0）
+# LLM 桌面宠物框架（桌宠莫拉 v2.0.0）
 
-> 当前版本 v1.1.0（`python debug.py --version`；更新记录见 CHANGELOG.md，
+> 当前版本 v2.0.0（`python debug.py --version`；更新记录见 CHANGELOG.md，
 > 版本规范见文末「版本与发布」附录，版本号唯一来源 settings.VERSION）。
 
 一个 LLM 驱动的桌面宠物框架：角色常驻你的电脑桌面，通过 OpenAI 兼容 API

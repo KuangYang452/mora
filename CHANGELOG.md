@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+（2.0.0 已发布；后续变更在此累积）
+
+## [2.0.0] - 2026-08-16
+
 ### 新增（1.2 易用性，见 docs/1.2_USABILITY_PLAN.md）
 
 - **内容模式（NSFW / SFW）开关**（`setting/app.ini` 的 `content_mode`，默认
@@ -100,7 +104,7 @@
 - **修复控制台窗口不定时闪现**：pythonw（无控制台）环境下，外部命令（PowerShell
   进程枚举、OCR、快捷方式创建、pip 安装等）每次调用都会新建控制台窗口一闪而过
   （此前 python.exe 启动时挂父控制台不显现）；统一加 `CREATE_NO_WINDOW`
-  （`rmgame/monitor.py` / `rmgame/ocr.py` / `launcher.py` / `make_shortcut.py`）。
+  （`rmgame/monitor.py` / `rmgame/ocr.py` / `launcher.py`）。
 
 ### 文档
 
