@@ -183,7 +183,8 @@ THINKING_STYLE_INSTRUCT = {
     ),
     "immersion": (
         "【角色沉浸要求】在你的思考（think 工具记录）中，请遵守以下规则：\n"
-        "1. 以角色第一人称直接陈述内心想法与感受，"
+        "1. 以角色第一人称直接陈述内心想法与感受，不要用（心想：…）等括号"
+        "包裹写法，"
         "2. 用第一人称描写角色的内心感受，例如\"我心想\"\"我觉得\"\"我暗自\"等\n"
         "3. 思考内容应沉浸在角色中："
         + (_CHAR.instantiate(_CHAR.immersion_perspective)
@@ -469,14 +470,50 @@ def _env_section(env: dict) -> str or None:
 
 
 # ---------------------------------------------------------------------------
-# 动态尾部段（移出 system prompt，由 pet.py 经 build_messages(pre_time=)
-# 在历史之后、时间锚点之前注入）：
-# - 【当前状态】：内心想法高频变化（模型每轮更新）；
-# - 【对方正在…】：游戏环境快照持续变化；
-# - 【本回合推进】：轮次计数每轮必变。
-# 三者若留在 system prompt 内，会在协议段与历史段之前切断缓存前缀
-# （静态在前、动态在后），故整体后置。
+# 半动态层（mid_static，由 pet.py 经 build_messages(mid_static=) 在静态
+# system 之后、中期记忆之前注入）与动态尾部段（pre_time，历史之后、
+# 时间锚点之前注入）：
+# - 半动态【好感等级规则】【已激活技能】：跨级/激活才变（按设计预期一日
+#   不跨级），参与日常缓存前缀；跨级断点只落在本段，身份块不受影响。
+# - 动态【对方正在…】：游戏环境快照持续变化；
+# - 动态【本回合可用工具】：随环境动态组装（有无游戏环境决定 rmgame 工具）；
+# - 动态【当前状态】：内心想法高频变化（模型每轮更新）；
+# - 动态【本回合推进】：轮次计数每轮必变。
+# 动态段若留在 system prompt 内，会在协议段与历史段之前切断缓存前缀
+# （静态在前、动态在后），故整体后置；半动态段按变化频率介于两者之间。
 # ---------------------------------------------------------------------------
+
+def mid_static_sections(state: dict = None) -> list:
+    """半动态段（mid_static 注入，静态 system 之后、中期记忆之前）：
+    好感等级规则 + 已激活技能 world book。
+
+    返回字符串列表（0~2 项），由调用方经 build_messages(mid_static=) 注入。
+    变化频率低于合并条目（等级跨级才变 / 技能激活才变），故位置在静态段
+    与中期记忆之间：日常请求逐字节稳定、参与缓存前缀；低频变化时断点只
+    落在本段，静态身份块与历史不受影响。好感等级仅注入当前一级（契约
+    字段优先 identity.json#affection_levels，自然语言，回退世界书条目）；
+    技能段仅注入 fetish_analysis 的世界书（按 state.skills 精确注入）。
+    输出经 _instantiate 实例化占位符（{{user}}/{{char}}/{{random::}} 等）——
+    契约文本可能含 SillyTavern 占位符，不实例化会原样泄漏给模型
+    （见日志 213405：等级规则里出现字面 {{user}}）。
+    """
+    state = state or {}
+    out = []
+    aff = int(state.get("affection", INITIAL_STATE["affection"]))
+    cur_level = level_for(aff)
+    _, levels, skills = _categorize_book(get_character())
+    level_text = None
+    idt_levels = (_CHAR.identity_data or {}).get("affection_levels") or {}
+    if isinstance(idt_levels, dict) and (idt_levels.get(cur_level) or "").strip():
+        level_text = idt_levels[cur_level].strip()
+    elif cur_level in levels:
+        level_text = levels[cur_level]
+    if level_text:
+        out.append("【好感等级规则】\n" + level_text)
+    if "fetish_analysis" in (state.get("skills") or []) and skills:
+        out.append("【已激活技能】\n" + "\n\n".join(skills))
+    return [_instantiate(s) for s in out]
+
 
 def state_section(state: dict = None) -> str:
     """当前状态段（动态尾部注入）：语义化状态叙述，好感度数值隐去。"""
@@ -524,10 +561,43 @@ def env_section(env: dict) -> str or None:
     return seg
 
 
+def tool_list_section(env: dict = None) -> str or None:
+    """工具清单段（动态尾部注入）：本回合可用工具的完整清单。
+
+    从静态行为协议段移出（清单随游戏环境动态变化，放尾部不切缓存前缀；
+    见 build_system_prompt 协议段只引用本段）。条目由 tools.SPECS 派生
+    （名称+简述+参数+返回值，与 function schema 同源，不会双源不一致）；
+    say / update_state / think 已有专门行为条目不重复列出。
+    动态组装规则：discover_running / start_game 常驻（发现与启动在任何
+    状态下都可用）；其余 rmgame 工具仅在有游戏环境时注入（没有环境时
+    读取/查询类工具不可用——模型应先用 discover_running 确认，再于
+    下一轮按尾部清单调用）。rmgame 关闭时全部 rmgame 工具不注入。
+    无工具可列（rmgame 关闭且仅剩内建工具被排除时）返回 None。
+    """
+    if not CONFIG.get("rmgame_enabled", True):
+        listed = [s for s in tools.specs(False)
+                  if s.name not in ("say", "update_state", "think")]
+    else:
+        env_on = bool(env)
+        listed = []
+        for s in tools.specs(True):
+            if s.name in ("say", "update_state", "think"):
+                continue
+            if s.rmgame and s.name not in ("discover_running", "start_game") \
+                    and not env_on:
+                continue
+            listed.append(s)
+    if not listed:
+        return None
+    lines = [t.prompt_entry() for t in listed]
+    return ("【本回合可用工具】\n"
+            + "\n".join("  · " + ln for ln in lines))
+
+
 def turn_section(agent_turn: tuple) -> str or None:
-    """本回合推进节奏段（动态尾部注入，多轮工具循环中每轮重建时带上），
-    引导模型按「规划 → 推进 → 交付」自发收敛——首轮给完整纪律与轮次
-    预算，后续轮逐步收紧，末轮强制交付。agent_turn=None 返回 None。
+    """本回合推进节奏段（每轮尾部注入——多轮工具循环中轮次计数每轮必变，
+    故不进入冻结前缀；首轮给完整纪律与轮次预算，后续轮逐步收紧，末轮
+    强制交付）。agent_turn=None 返回 None。
     """
     if agent_turn is None:
         return None
@@ -539,8 +609,8 @@ def turn_section(agent_turn: tuple) -> str or None:
     elif turn <= 1:
         rhythm = (f"本回合你最多可自主推进 {max_turns} 轮工具调用。"
                   "建议节奏：需要多轮查证时，先用 think 写下分析计划与"
-                  "待验证要点，再将查询工具一次性批量调用（可在同一轮同时"
-                  "调用多个）；每轮得出关键结论后更新 think，"
+                  "待验证要点；每轮最多调用一个查询工具，多轮查证时逐轮"
+                  "推进并把每轮关键结论写入 think，"
                   "基于结果组织台词后，信息足够立即调用 say 交付；"
                   "不要零散地一次只查一项，也不要为查而查。")
     else:
@@ -551,16 +621,18 @@ def turn_section(agent_turn: tuple) -> str or None:
 
 
 def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str:
-    """把角色卡原文 + 语义化状态组装为系统提示词（只含静态内容）。
+    """把角色卡原文组装为系统提示词（只含静态内容）。
 
-    身份/性格/情境/记忆/好感等级规则/技能/行为协议。**输出与 env 无关**：
-    env 参数仅作契约占位（游戏环境信息全部由 env_section 在动态尾部注入，
-    game_context 的 world_book 与 GAME_RULES 全文随其【游戏点评规则】段），
-    自测以 prompt_env == sys_prompt 断言保护——缓存前缀不随游戏启停变化。
-    动态内容（【当前状态】/【对方正在…】/【本回合推进】）由 state_section /
-    env_section / turn_section 生成、经调用方在消息序列后部注入（见
-    ContextManager.build_messages 的 pre_time 参数）——避免在 system prompt
-    内出现高频变化文本而切断缓存前缀。
+    身份/性格/情境/记忆/行为协议。**输出与 state 等级段、env 无关**：
+    好感等级规则与技能 world book 是半动态段（mid_static_sections，跨级/
+    激活才变），游戏环境信息全部由 env_section 在动态尾部注入，
+    game_context 的 world_book 与 GAME_RULES 全文随其【游戏点评规则】段——
+    静态段因此完全字节稳定（缓存前缀不随等级/技能/游戏启停变化）。
+    动态内容（【对方正在…】/【本回合可用工具】/【当前状态】）由 env_section /
+    tool_list_section / state_section 生成、经调用方在消息序列后部注入（见
+    ContextManager.build_messages 的 pre_time 参数）；【本回合推进】由
+    turn_section 生成、每轮尾部注入——避免在 system prompt 内出现高频
+    变化文本而切断缓存前缀。
     原则：
     - 角色卡怎么写就怎么用——不删减、不改写、不做内容过滤。
     - 状态只以语义化叙述出现（_semantic_state），LLM 看不到任何结构。
@@ -569,7 +641,6 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     - 技能注入不依赖原生思考模式（setting/llm.ini 的 reasoning）：推理通道是
       think 工具（始终可用），fetish_analysis 在激活时照常注入。
     """
-    state = state or dict(INITIAL_STATE)
     parts = []
 
     if _CHAR.render_identity():
@@ -608,48 +679,28 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     )
 
     # 条件层：世界书按用途分类注入（不再无条件全量）
-    style, levels, skills = _categorize_book(card)
+    style, _levels, _skills = _categorize_book(card)
     if style and CONFIG.get("mesugaki_style_block", False):
         # <Mesugaki> 风格块（2024 年旧模块，默认关闭）：当时 LLM 可能未内化
         # mesugaki 语言风格故单独注入；现模型已内化，靠人设段即可。
         # 启用时原样注入，但剥离与工具调用协议冲突的叙述教条（_adapt_style）。
         parts.append("【风格】\n" + "\n\n".join(_adapt_style(s) for s in style))
-    aff = int(state.get("affection", INITIAL_STATE["affection"]))
-    cur_level = level_for(aff)
-    # 好感等级：契约字段优先（identity.json#affection_levels，自然语言重写版，
-    # 无 YAML 结构），回退世界书条目（原卡 YAML 风格，仅当前一级）。
-    level_text = None
-    idt_levels = (_CHAR.identity_data or {}).get("affection_levels") or {}
-    if isinstance(idt_levels, dict) and (idt_levels.get(cur_level) or "").strip():
-        level_text = idt_levels[cur_level].strip()
-    elif cur_level in levels:
-        level_text = levels[cur_level]
-    if level_text:
-        parts.append("【好感等级规则】\n" + level_text)
-    active_skills = list(state.get("skills") or [])
-    # 技能段注入：仅 fetish_analysis 的角色卡世界书（<Fetish_analysys>）
-    # 进入静态 system prompt（按 state.skills 精确注入，不整表拖带）。
-    # game_context 不在此注入：其 world_book 与 GAME_RULES 全文随游戏环境段
-    # （env_section 的【游戏点评规则】）注入，使静态 system prompt 输出与
-    # env 无关、不随游戏启停出现/消失（缓存前缀稳定）。
-    if "fetish_analysis" in active_skills and skills:
-        parts.append("【已激活技能】\n" + "\n\n".join(skills))
+    # 好感等级与技能 world book 不进入静态 system prompt（半动态层
+    # mid_static_sections 注入，见下）：等级规则跨级才变、技能激活才变，
+    # 埋在静态块中部会在低频变化时切断缓存前缀（见日志 203145/203141
+    # hit=1280 实测）；移出后静态段完全字节稳定。
 
     # 行为协议：台词与状态更新都走原生工具调用（function calling）。
     # 激活指令由 ContextManager 作为对话上下文之后的独立 system 消息附加。
-    # 工具清单与 function schema 同源（唯一来源 tools.SPECS）：rmgame 工具按
-    # CONFIG["rmgame_enabled"] 过滤（schema 未注册的工具不得出现在提示词里，
-    # 避免模型调用得到"未知工具"）。清单为「名称+简述+参数+返回值」，
-    # 由 SPECS 派生渲染（与 API 注册的 schema 同源，不会双源不一致）；
-    # say/update_state/think 已有专门行为条目不重复列出。
-    listed_tools = tools.specs(rmgame_enabled=CONFIG.get("rmgame_enabled", True))
+    # 工具清单不在协议段逐条列出（随尾部【本回合可用工具】段动态注入，
+    # 见 tool_list_section——清单随游戏环境变化，放尾部不切缓存前缀）；
+    # 清单与 function schema 同源（唯一来源 tools.SPECS），由 SPECS 派生
+    # 渲染（与 API 注册的 schema 同源，不会双源不一致）。
     listed_skills = SKILLS
     if not CONFIG.get("rmgame_enabled", True):
         listed_skills = {k: v for k, v in SKILLS.items() if k != "game_context"}
     skills_desc = "、".join(
         f"「{k}」({v['desc']}；{v['trigger_hint']})" for k, v in listed_skills.items())
-    tool_lines = [t.prompt_entry() for t in listed_tools
-                  if t.name not in ("say", "update_state", "think")]
     proto = (
         "【每回合的行为方式】\n"
         "你的一切输出都必须通过工具完成，不得输出工具之外的文本：\n"
@@ -663,17 +714,18 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
         "  · skills：技能开关。" + skills_desc + "，用不到就传空数组。\n"
         "- 思考：多轮推进时调用 think 工具记录分析框架与跨轮结论：开始前先写下"
         "计划/待验证要点，每轮查询得出关键结论后更新它"
-        "（查询结果只保留最近一轮、更早的结果不再保留，需跨轮引用的结论必须经 "
+        "（查询结果只保留最近两轮、更早的结果不再保留，需跨轮引用的结论必须经 "
         "think 保留）。你的完整思路链会以思考块呈现在对话中：块首是思考标记，"
         "块内按轮次累积 think 文本，工具调用以单行反引号追加在链内"
         "（如 `query_archive:关键词`）；块保持开放、不闭合——思考是否结束"
         "由你调用 say 工具交付来体现。think 仅本回合内可见、回合结束后不保留；"
         "区别于 update_state 的 inner_thought——那是持久状态，会保留到后续回合；"
         "长期记忆用 mora_notes。\n"
-        "- 工具结果：查询结果以 tool 消息回传，只保留最近一轮的工具调用与结果；"
+        "- 工具结果：查询结果以 tool 消息回传，只保留最近两轮的工具调用与结果；"
         "不要在结果可见前凭猜测作答。\n"
-        "- 其他工具（调用即执行并返回结果）：\n"
-        + "\n".join("  · " + line for line in tool_lines) + "\n"
+        "- 其他工具：本回合可用工具及完整用法见尾部【本回合可用工具】段（与函数"
+        "schema 同源）；**查询类工具每轮最多调用一个**——多轮查证时逐轮推进、"
+        "把结论写入 think，不要在同一轮批量调用多个查询。\n"
         "- 对话边界：对话中只有两个常驻对象：你（"
         f"{_CHAR.display_name}）与对方（你称他「{_CHAR.user_ref}」）。"
         "对话或游戏里出现的其他人名/角色名都是对方讲述的故事或游戏中的角色，"
@@ -686,7 +738,8 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     proto += (
         "- 环境缺失时的行为：提示词中没有游戏环境信息时，说明你不清楚对方此刻"
         "在做什么——不要凭空猜测，直接说明暂时看不到"
-        + ("（可调用 read_current_text 等工具确认）。\n"
+        + ("（可用 discover_running 查看当前是否有游戏在运行；有游戏运行时，"
+           "相关读取工具会出现在尾部【本回合可用工具】段）。\n"
            if CONFIG.get("rmgame_enabled", True) else "。\n")
         + ("- 启动游戏：对方请求启动/打开某个 RPG Maker 游戏时（即使游戏当前未运行），"
            "调用 start_game 启动（game 用游戏库中的名称或 slug，可用 discover_running "
@@ -697,8 +750,8 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
         'say：text = "哦～？终于想通要来找我聊聊了吗？那就让我听听你的故事吧～"\n'
         'update_state：affection_delta = 1、inner_thought = "他总算愿意开口了"、'
         'emote = "得意"、bounce = true、skills = []' + "\n"
-        "本回合内可连续多次调用工具（查询工具 / update_state / say）自主推进工作，"
-        "查询工具与 update_state 会立即执行并返回结果，你可据此继续；"
+        "本回合内可连续多次调用工具自主推进工作（每轮最多一个查询工具；"
+        "查询工具 / update_state 会立即执行并返回结果，你可据此继续）；"
         "调用 say 说出台词即结束本回合。\n"
         "【输出红线】\n"
         "- 台词必须通过 say 工具说出：不要直接输出文本，也不要在文本里写"
@@ -1271,8 +1324,17 @@ def selftest() -> None:
     # 提示词结构：三个"情境"已合并；激活指令 + 条件注入
     for old in ("【场景】", "【当前情境】", "【你现在身处的情境】", "【对话规则】"):
         assert old not in sys_prompt, f"旧段名残留: {old}"
-    for new in ("【情境】", "【好感等级规则】", "【记忆与回忆】"):
+    for new in ("【情境】", "【记忆与回忆】"):
         assert new in sys_prompt, f"缺少新段: {new}"
+    # 好感等级规则是半动态段（mid_static_sections，跨级才变），不进入静态段
+    assert "【好感等级规则】" not in sys_prompt, \
+        "等级规则应移出静态 system prompt（半动态层 mid_static_sections）"
+    mid_static_def = mid_static_sections(dict(INITIAL_STATE))
+    assert any("【好感等级规则】" in s for s in mid_static_def), \
+        "mid_static 应含当前等级规则"
+    assert "<Fetish_analysys>" not in "\n".join(mid_static_def), "默认无技能不注入"
+    assert "{{" not in "\n".join(mid_static_def), \
+        "mid_static 应实例化占位符（{{user}} 等不得泄漏，见日志 213405）"
     # 记忆分层认知：三层框架 + 主动检索引导（落在【记忆与回忆】段内）
     mem_body = sys_prompt.split("【记忆与回忆】", 1)[1]
     mem_seg = mem_body.split("\n\n【", 1)[0]   # 按段落边界截取，段内【中期记忆】不截断
@@ -1283,7 +1345,9 @@ def selftest() -> None:
     assert "skills" in sys_prompt, "技能工具字段缺失"
     # 好感等级仅注入当前一级（初遇），其他等级条目不注入；契约版为
     # 自然语言叙述（identity.json#affection_levels 或 profile 好感等级）
-    level_seg = sys_prompt.split("【好感等级规则】")[1].split("【")[0]
+    level_seg = next(s for s in mid_static_sections(dict(INITIAL_STATE))
+                     if s.startswith("【好感等级规则】"))
+    level_seg = level_seg.split("【好感等级规则】", 1)[1]
     assert level_seg.strip(), "好感等级段为空"
     assert "恋慕" not in level_seg and "亲爱" not in level_seg, "不应注入其他等级"
     # 技能默认不注入（LLM 未激活）
@@ -1314,31 +1378,45 @@ def selftest() -> None:
     assert "仅本回合内可见" in sys_prompt and "回合结束后不保留" in sys_prompt, \
         "think 语义（回合内可见、回合后不保留）缺失"
     assert "那是持久状态" in sys_prompt, "think 应区别于 inner_thought（持久状态）"
-    assert "只保留最近一轮" in sys_prompt and "更早的结果不再保留" in sys_prompt, \
+    assert "只保留最近两轮" in sys_prompt and "更早的结果不再保留" in sys_prompt, \
         "think 引导应说明结果过期机制（跨轮引用必须 think 保留）"
     assert "先写下计划" in sys_prompt, "think 引导应有主动规划用法（先计划→逐轮更新结论）"
     assert "思考块" in sys_prompt and "反引号" in sys_prompt, \
         "行为协议应说明多轮循环的思考块呈现（think 文本累积 + 反引号工具调用）"
     assert "不闭合" in sys_prompt, "思考块应说明保持开放（增量式不闭合，防误解为思考已结束）"
-    # 工具结果通道：结果以 tool 消息回传、只保留最近一轮，行为协议应有语义说明
+    # 工具结果通道：结果以 tool 消息回传、只保留最近两轮，行为协议应有语义说明
     assert "以 tool 消息回传" in sys_prompt, "行为协议应说明工具结果经 tool 消息回传"
-    assert "只保留最近一轮的工具调用与结果" in sys_prompt, \
-        "行为协议应说明工具结果只保留最近一轮"
+    assert "只保留最近两轮的工具调用与结果" in sys_prompt, \
+        "行为协议应说明工具结果只保留最近两轮"
     assert "凭猜测作答" in sys_prompt, "工具结果语义应禁止结果可见前猜测作答"
+    # 查询限一：协议段应声明查询类工具每轮最多一个
+    assert "每轮最多调用一个" in sys_prompt, "协议应声明查询类工具每轮最多一个"
+    assert "「read_current_text」" not in sys_prompt and "参数：" not in sys_prompt, \
+        "工具清单条目应移出静态段（尾部动态注入）"
     # 输出红线：禁令 + 替代（不展示完整错误范例，避免反向污染/重教旧协议）
     assert "【输出红线】" in sys_prompt, "输出红线缺失"
     assert "不要直接输出文本" in sys_prompt and "伪调用" in sys_prompt, "红线缺直出/伪调用禁令"
     assert "不要把参数内容或旧 JSON 格式" in sys_prompt, "红线缺参数/旧 JSON 禁令"
-    # 工具清单（其他工具）：名称+简述+参数+返回值，由 tools.SPECS 派生
-    # （单一来源，与 function schema 同源）；say/update_state/think 已有专门
-    # 行为条目不重复列出；示例格式统一（工具名：参数）
+    # 工具清单（【本回合可用工具】尾部动态段）：名称+简述+参数+返回值，
+    # 由 tools.SPECS 派生（单一来源，与 function schema 同源）；say/
+    # update_state/think 已有专门行为条目不重复列出；discover_running /
+    # start_game 常驻，其余 rmgame 工具仅在有游戏环境时注入
+    tl_env = tool_list_section({"game": "猎妻迷宫", "map_name": "Map001"})
+    assert tl_env and "【本回合可用工具】" in tl_env, "有 env 应生成工具清单段"
     for t in tools.specs(rmgame_enabled=CONFIG.get("rmgame_enabled", True)):
         if t.name in ("say", "update_state", "think"):
-            assert f"「{t.name}」" not in sys_prompt, f"{t.name} 有专门条目不进清单"
+            assert f"「{t.name}」" not in tl_env, f"{t.name} 有专门条目不进清单"
         else:
-            assert f"「{t.name}」" in sys_prompt, f"清单缺少 {t.name}"
-    assert "参数：" in sys_prompt and "返回：" in sys_prompt, \
+            assert f"「{t.name}」" in tl_env, f"清单缺少 {t.name}"
+    assert "参数：" in tl_env and "返回：" in tl_env, \
         "清单应为名称+简述+参数+返回值格式"
+    # 无 env（纯聊天回合）：读取/查询类 rmgame 工具不注入，发现与启动常驻
+    tl_none = tool_list_section(None)
+    assert tl_none and "「discover_running」" in tl_none and "「start_game」" in tl_none, \
+        "无 env 时 discover/start 应常驻"
+    assert "「query_wiki」" not in tl_none and "「read_current_text」" not in tl_none, \
+        "无 env 时读取/查询类 rmgame 工具不应注入"
+    assert "「query_archive」" in tl_none and "「mora_notes」" in tl_none, "常开工具应保留"
     assert "say：text =" in sys_prompt and "update_state：affection_delta = 1" in sys_prompt, "示例格式应统一"
     # 防御性精简：冗余说明不重复（工具参数只在调用时填写 / 台词规范 只出现一次）
     assert "如果状态没有变化且无需查询" not in sys_prompt, "赘余收尾句应移除"
@@ -1677,7 +1755,11 @@ def selftest() -> None:
         sp_off = build_system_prompt(card, state=dict(INITIAL_STATE))
         assert "query_wiki" not in sp_off and "start_game" not in sp_off, \
             "rmgame 关闭后提示词不应列出 rmgame 工具"
-        assert "query_archive" in sp_off and "mora_notes" in sp_off, "常开工具应保留"
+        assert "「read_current_text」" not in sp_off, "工具清单条目应移出静态段"
+        tl_off = tool_list_section(None)
+        assert tl_off and "query_wiki" not in tl_off and "start_game" not in tl_off, \
+            "rmgame 关闭后工具清单不应含 rmgame 工具"
+        assert "query_archive" in tl_off and "mora_notes" in tl_off, "常开工具应保留"
         assert "可调用 read_current_text" not in sp_off, "开关关闭后不应提示调用 rmgame 工具"
         assert "【对方正在…】" not in sp_off
         assert "game_context" not in sp_off, "开关关闭后技能清单不应含 game_context"
@@ -1822,12 +1904,15 @@ def selftest() -> None:
     assert st2["skills"] == [], st2  # 白名单过滤：未知技能被剔除
     st2 = apply_state(st2, parse_llm_reply('{"reply": "x"}'))
     assert st2["skills"] == [], st2  # 未声明 → 保留（已为 []）
-    # 技能激活后注入：提示词包含 Fetish 分析内容
-    sys_prompt_skill = build_system_prompt(card, state={"affection": 20,
-                                                        "inner_thought": "x",
-                                                        "skills": ["fetish_analysis"]})
-    assert "<Fetish_analysys>" in sys_prompt_skill, "技能激活后应注入分析内容"
-    assert "【已激活技能】" in sys_prompt_skill, "缺少技能段"
+    # 技能激活后注入：半动态层（mid_static_sections）包含 Fetish 分析内容，
+    # 静态 system prompt 不含（保持字节稳定）
+    st_skill = {"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]}
+    sys_prompt_skill = build_system_prompt(card, state=st_skill)
+    assert "<Fetish_analysys>" not in sys_prompt_skill, \
+        "技能 world book 应移出静态段（半动态层 mid_static_sections）"
+    mid_skill = "\n".join(mid_static_sections(st_skill))
+    assert "<Fetish_analysys>" in mid_skill, "技能激活后 mid_static 应注入分析内容"
+    assert "【已激活技能】" in mid_skill, "缺少技能段"
     # 心理 COT：注入激活指令（build_activation），<thinking_format> 包裹，
     # 仅 fetish_analysis 激活；不依赖原生思考模式（reasoning）
     act_skill = build_activation({"affection": 20, "skills": ["fetish_analysis"]}, card)
@@ -1879,19 +1964,46 @@ def selftest() -> None:
     assert st_any["skills"] == ["fetish_analysis"], "fetish_analysis 白名单不依赖原生思考模式"
     sp_any = build_system_prompt(card, state={"affection": 20, "inner_thought": "x",
                                               "skills": ["fetish_analysis"]})
-    assert "fetish_analysis" in sp_any, "技能清单/已激活技能不依赖原生思考模式"
-    assert "【已激活技能】" in sp_any
-    # 动态尾部段（移出 system prompt）：状态/环境/推进由独立函数生成
+    assert "fetish_analysis" in sp_any, "技能字段不依赖原生思考模式"
+    assert "【已激活技能】" not in sp_any, "技能段应只在 mid_static 注入"
+    assert "【已激活技能】" in "\n".join(mid_static_sections(
+        {"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]}))
+    # 动态尾部段（移出 system prompt）：状态/环境/工具清单/推进由独立函数生成
     ts1 = turn_section((1, 4))
     assert ts1 and "【本回合推进】" in ts1 and "最多可自主推进 4 轮" in ts1, ts1
+    assert "每轮最多调用一个查询工具" in ts1, "推进段应声明查询限一"
     ts_mid = turn_section((3, 4))
     assert "已进行 2 轮" in ts_mid, ts_mid
     ts_end = turn_section((4, 4))
     assert "第 4/4 轮（上限）" in ts_end and "不要再调用其他工具" in ts_end, ts_end
     assert turn_section(None) is None
     assert "【本回合推进】" not in sys_prompt, "推进段应移出 system prompt（动态尾部注入）"
-    print("  技能管理: 白名单过滤 → 按需注入 → 心理COT（激活指令 <thinking_format>）→ 思维链风格二选一（指向 think 工具）✓ | 与原生思考解耦 ✓")
-    print("  动态尾部段: state_section（好感度隐去）/ env_section / turn_section ✓")
+    # mid_static / 工具清单 / 时间冻结的组装集成：半动态段在静态与中期记忆
+    # 之间，工具清单在历史之后，激活指令仍是最后一条
+    from context import ContextManager as _CM
+    ctx_i = _CM(rounds=2, opening=["开场A", "开场B"])
+    ctx_i.add_user("你好")
+    ctx_i.add_assistant("哼哼～")
+    msgs_i = ctx_i.build_messages(
+        sys_prompt,
+        activation="ACT",
+        first_user_instr=thinking_style_for(dict(INITIAL_STATE)),
+        pre_time=[env_section(None) or "E",
+                  tool_list_section(None) or "T",
+                  state_section(dict(INITIAL_STATE))],
+        mid_static=mid_static_sections(dict(INITIAL_STATE)),
+    )
+    assert msgs_i[0]["role"] == "system", "静态段在前"
+    assert "【好感等级规则】" in msgs_i[1]["content"], "半动态段应在静态之后"
+    assert msgs_i[2]["role"] != "system", "半动态段之后才是历史（开场白为 assistant）"
+    tail_sys = [m["content"] for m in msgs_i if m["role"] == "system"]
+    assert any("【本回合可用工具】" in c for c in tail_sys), "工具清单段应注入（尾部）"
+    assert "【当前时间】" in msgs_i[-2]["content"] and msgs_i[-1]["content"].endswith("ACT"), \
+        "时间锚点在激活指令之前"
+    assert not any("【本回合推进】" in c for c in tail_sys), \
+        "推进段应由调用方在每轮尾部追加（不进冻结前缀）"
+    print("  技能管理: 白名单过滤 → 半动态注入（mid_static）→ 心理COT（激活指令 <thinking_format>）→ 思维链风格二选一（指向 think 工具）✓ | 与原生思考解耦 ✓")
+    print("  动态尾部段: state_section（好感度隐去）/ env_section / tool_list_section（环境过滤）/ turn_section ✓")
 
     print("[selftest] 全部通过 ✓")
     print(f"  系统提示词长度: {len(sys_prompt)} 字符（仅静态段）")

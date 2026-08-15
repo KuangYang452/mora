@@ -17,6 +17,7 @@ import random
 import threading
 import time
 import tkinter as tk
+from datetime import datetime
 from pathlib import Path
 from tkinter import font as tkfont
 
@@ -44,10 +45,12 @@ from llm import (
     extract_tool_calls,
     get_character,
     has_query_intent,
+    mid_static_sections,
     parse_llm_response,
     state_section,
     summarize_history,
     thinking_style_for,
+    tool_list_section,
     tool_result_text,
     turn_section,
 )
@@ -86,6 +89,11 @@ _QUERY_TOOL_NAMES = tools.query_names(
     rmgame_enabled=CONFIG.get("rmgame_enabled", True))
 _GAME_TOOL_NAMES = tools.game_world_names(
     rmgame_enabled=CONFIG.get("rmgame_enabled", True))
+# 查询限一校验（防批量查询撑爆结果区预算）：每轮最多一个**大结果**查询
+# 工具（结果可能很大的查询；discover_running 只返回小名称列表，不计入）。
+# 隐性篇幅上限 = 两次查询结果之和（保留最近两轮、不截断），见 _request_llm。
+_QUERY_LIMIT_NAMES = (_QUERY_TOOL_NAMES | {"query_archive"}) \
+    - {"discover_running"}
 
 # 上次对话距今多久的语义化描述；过近（<60 秒）或无法解析返回 None
 # ---------------------------------------------------------------------------
@@ -700,9 +708,13 @@ class MoraPet:
         显示并累积，回合结束时与最终台词合并为一条 assistant 消息进历史
         （一次输入的多轮推进在上下文里只算一条，中间对话内容不丢弃）。
         工具结果回传：每轮工具调用后回传配对的 tool 角色消息（OpenAI
-        兼容协议必需，缺失会导致 400）；agent_msgs 只保留最近一轮配对
+        兼容协议必需，缺失会导致 400）；agent_msgs 只保留最近两轮配对
         （更早的 tool 结果不再保留），跨轮信息由 think 链承载——最新
         assistant 消息的 <think> 块含完整累积链。
+        缓存前缀：**冻结 once 前缀**——环境/状态/工具清单/当前时间（取
+        循环触发时刻）/激活指令在循环开始前只组装一次，循环内每轮复用
+        （逐字节稳定）；每轮只追加 turn_section 与 agent_msgs（工作区）。
+        多轮循环内第 2 轮起整段前缀可命中缓存，只支付每轮增量成本。
         所有 UI 操作经 root.after 调度回主线程（tkinter 非线程安全）。
         """
         max_turns = max(1, int(CONFIG.get("agent_max_turns", 4)))
@@ -710,7 +722,7 @@ class MoraPet:
         self._think_chain = ""          # 本回合累积思路链（每轮追加，块不闭合）
         self._queried_before = False    # 本回合是否已调过查询工具（意向-动作校验）
         self._queried_count = 0         # 本输入内查询工具调用次数（重复查询校验）
-        agent_msgs = []          # 本回合累积：最近一轮 assistant(累积链) + tool 结果
+        agent_msgs = []          # 本回合累积：最近两轮 assistant(累积链) + tool 结果
         interim_lines = []       # 中间轮台词（回合末与最终台词合并为一条进历史）
         last_parsed = None
         last_content = ""
@@ -719,30 +731,39 @@ class MoraPet:
             # 首轮前：历史超长则合并最旧部分（LLM 压缩 + 归档），
             # 控制上下文长度；失败保持现状（下次输入再试）
             self.ctx.ensure_merged(self._merge_history)
+            # ---- 冻结 once 前缀（循环内逐字节稳定，缓存前缀）----
+            loop_time = datetime.now()          # 时间锚点冻结：循环触发时刻
+            env = self._env_snapshot()
+            self._ensure_event_summary(env)     # 需要回应前：缺失则同步生成摘要
+            state_frozen = dict(self.state)     # 状态段冻结：循环开始时的状态
+            self.sys_prompt = build_system_prompt(
+                self.card, state=state_frozen, env=env)
+            pre_time = []
+            es = env_section(env) if env else None
+            if es:
+                pre_time.append(es)
+            tl = tool_list_section(env)
+            if tl:
+                pre_time.append(tl)
+            pre_time.append(state_section(state_frozen))
+            self._frozen_msgs = self.ctx.build_messages(
+                self.sys_prompt,
+                activation=build_activation(state_frozen, self.card),
+                first_user_instr=thinking_style_for(state_frozen),
+                pre_time=pre_time,
+                mid_static=mid_static_sections(state_frozen),
+                now=loop_time,
+            )
             for turn in range(1, max_turns + 1):
                 retried_this_turn = False
                 self._set_status("正在思考…")
-                # 每轮重建 system prompt：只含静态段（身份/性格/情境/记忆/
-                # 等级规则/技能/协议）；动态段（状态/环境/推进）作为独立
-                # system 消息注入历史之后（pre_time），静态段与历史段因此
-                # 成为稳定缓存前缀（静态在前、动态在后）。
-                env = self._env_snapshot()
-                self._ensure_event_summary(env)   # 需要回应前：缺失则同步生成摘要（生成完才组装提示词）
-                self.sys_prompt = build_system_prompt(
-                    self.card, state=self.state, env=env)
-                pre_time = []
-                pre_time.append(state_section(self.state))
-                es = env_section(env) if env else None
-                if es:
-                    pre_time.append(es)
-                pre_time.append(turn_section((turn, max_turns)))
-                messages = self.ctx.build_messages(
-                    self.sys_prompt,
-                    activation=build_activation(self.state, self.card),
-                    first_user_instr=thinking_style_for(self.state),
-                    pre_time=pre_time,
-                )
-                messages += agent_msgs
+                # 每轮尾部追加：轮次推进段（每轮必变，不进冻结前缀）
+                # + agent_msgs（think 累积链 + 最近两轮工具结果）。
+                # 冻结前缀（身份/等级/记忆/历史/环境/工具清单/状态/时间/
+                # 激活指令）在循环内逐字节不变 → 第 2 轮起整段缓存命中。
+                messages = self._frozen_msgs + [
+                    {"role": "system", "content": turn_section((turn, max_turns))},
+                ] + agent_msgs
                 self._last_messages = messages
                 raw = call_llm(messages, tools=_build_tools(), kind="round",
                                retry=True, note="回合对话")
@@ -758,7 +779,7 @@ class MoraPet:
                 last_content = (msg.get("content") or "").strip()
                 calls = extract_tool_calls(raw)
                 # 本回合此前是否已调用过查询工具：用回合内持久标志
-                # （agent_msgs 只保留最近一轮，无法再从旧轮 tool_calls 判断）——
+                # （agent_msgs 只保留最近两轮，无法再从旧轮 tool_calls 判断）——
                 # 已查过说明查询动机已兑现，后续收尾台词引用"翻书/查过"等
                 # 是修辞总结而非新意图，不再拦截。
                 queried_before = self._queried_before
@@ -855,7 +876,7 @@ class MoraPet:
                 # 查询工具、且本输入此前已查询过 → 注入修复指令重试一次。
                 # 见日志 0559xx：同一输入内 read+wiki 重复 3 轮、返回逐字相同
                 # （快照/词条均未变化），think 结论每轮重写——查询结果只保留
-                # 最近一轮，think 轮后上一轮结果已从上下文移除，模型被迫重查。
+                # 最近两轮，think 轮后更早结果已从上下文移除，模型被迫重查。
                 # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
                 if (CONFIG.get("retry_on_repeated_query", True)
                         and not retried_this_turn
@@ -869,11 +890,40 @@ class MoraPet:
                          "content": "（你已在本回合完成过一轮查询，think 结论中"
                                     "已记录答案依据。不要重复查询相同内容："
                                     "若信息已足够，请直接调用 say 工具说出台词；"
-                                    "仅当确需查证不同的新内容时，才一次性批量"
-                                    "查询后再交付。）"}]
+                                    "仅当确需查证不同的新内容时，再查询一次"
+                                    "（每轮最多一个查询工具）后再交付。）"}]
                     self._last_messages = fix_msgs
                     raw = call_llm(fix_msgs, tools=_build_tools(), kind="round",
                                    retry=True, note="回合对话（重复查询校验重试）")
+                    parsed = parse_llm_response(raw)
+                    state_before = dict(self.state)
+                    self.state = apply_state(self.state, parsed)
+                    self._run_tools(parsed)
+                    logutil.log_round(fix_msgs, raw_reply=raw, parsed=parsed,
+                                      state_before=state_before, state_after=self.state)
+                    last_parsed = parsed
+                    msg = raw["choices"][0]["message"]
+                    last_content = (msg.get("content") or "").strip()
+                    calls = extract_tool_calls(raw)
+                    retried_this_turn = True
+                # 查询限一校验（防单轮批量查询撑爆结果区预算）：本回合调用
+                # 多个大结果查询工具 → 注入修复指令重试一次，强制每轮限一个。
+                # 结果区隐性预算 = 保留两轮（两轮查询结果之和，结果不截断），
+                # 用数量换可预期性（见 _QUERY_LIMIT_NAMES 注释）。
+                # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
+                if (CONFIG.get("retry_on_multi_query", True)
+                        and not retried_this_turn
+                        and sum(1 for c in calls
+                                if c["name"] in _QUERY_LIMIT_NAMES) >= 2):
+                    fix_msgs = messages + [
+                        {"role": "assistant", "content": msg.get("content") or ""},
+                        {"role": "user",
+                         "content": "（查询工具每轮最多调用一个。请只保留本轮最"
+                                    "关键的那一次查询，其余待验证要点先写入 "
+                                    "think，在后续轮次逐轮查询后再交付。）"}]
+                    self._last_messages = fix_msgs
+                    raw = call_llm(fix_msgs, tools=_build_tools(), kind="round",
+                                   retry=True, note="回合对话（查询限一校验重试）")
                     parsed = parse_llm_response(raw)
                     state_before = dict(self.state)
                     self.state = apply_state(self.state, parsed)
@@ -952,15 +1002,15 @@ class MoraPet:
                         "tool_call_id": c.get("id") or "",
                         "content": result,
                     })
-                # 只保留最近一轮配对：旧轮 assistant(tool_calls)+tool 整对移除，
-                # 避免工具结果随轮数线性累积（上下文成本有界）。跨轮信息由
-                # think 链承载——最新 assistant 消息的 <think> 块含完整累积链，
-                # 推理过程不丢；旧轮 tool 结果如需跨轮引用须已写入 think。
-                last_asst = max(
-                    (i for i, m in enumerate(agent_msgs)
-                     if m.get("role") == "assistant"), default=None)
-                if last_asst is not None and last_asst > 0:
-                    agent_msgs = agent_msgs[last_asst:]
+                # 只保留最近两轮配对：更旧的 assistant(tool_calls)+tool 整对
+                # 移除，避免工具结果随轮数线性累积（上下文成本有界 = 两次
+                # 查询结果之和，结果本身不截断）。跨轮信息由 think 链承载——
+                # 最新 assistant 消息的 <think> 块含完整累积链，推理过程不丢；
+                # 更旧轮 tool 结果如需跨轮引用须已写入 think。
+                asst_idx = [i for i, m in enumerate(agent_msgs)
+                            if m.get("role") == "assistant"]
+                if len(asst_idx) > 2:
+                    agent_msgs = agent_msgs[asst_idx[-2]:]
             self.root.after(0, lambda p=last_parsed, f=finished, c=last_content,
                             il=list(interim_lines):
                             self._finish_agent(p, not f, c, il))
@@ -1020,7 +1070,7 @@ class MoraPet:
         工具调用信息已由 _request_llm 以单行反引号追加进累积思路链
         （如 `read_current_text:猎妻迷宫`）。返回的 result 由 _request_llm
         追加为配对 tool_call_id 的 tool 角色消息（OpenAI 兼容协议必需，
-        缺失会导致 400）；agent_msgs 只保留最近一轮配对，完整返回内容
+        缺失会导致 400）；agent_msgs 只保留最近两轮配对，完整返回内容
         同时输出到控制台供调试。
 
         call：extract_tool_calls 提取的 {id, name, arguments}。
@@ -1058,10 +1108,10 @@ class MoraPet:
             # 隔离（与环境段的 <game_environment> 同一套标签体系）。
             result = f"<game_data>\n{result}\n</game_data>"
         if name in _QUERY_TOOL_NAMES or name == "query_archive":
-            # 查询结果留存提醒（结果只保留最近一轮，跨轮结论必须 think 记录）。
+            # 查询结果留存提醒（结果只保留最近两轮，跨轮结论必须 think 记录）。
             # 放在包裹外（元信息，不属于游戏世界内容）；见日志 052450 输入16：
             # 模型 8 轮交替查询却从不 think 留存，结果全部随覆盖丢弃。
-            result += "\n\n查询结果仅保留最近一轮，关键结论请用 think 工具记录。"
+            result += "\n\n查询结果仅保留最近两轮，关键结论请用 think 工具记录。"
         print(f"\n{'=' * 20} 工具调用: {name} {'=' * 20}")
         print(f"参数: {args_raw}")
         print(f"{'=' * 20} 工具返回 {'=' * 20}")

@@ -23,9 +23,13 @@ from textutil import strip_paren_annotations
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
 
 
-def current_time_text() -> str:
-    """语义化当前时间：此刻是 2026年8月12日（周三）22:15。"""
-    now = datetime.now()
+def current_time_text(now: datetime = None) -> str:
+    """语义化当前时间：此刻是 2026年8月12日（周三）22:15。
+
+    now 可传入固定时刻：多轮工具循环中时间锚点应在循环触发时冻结一次
+    （循环内每轮复用同一时刻，前缀逐字节稳定，利于缓存命中）。
+    """
+    now = now or datetime.now()
     return (f"此刻是 {now.year}年{now.month}月{now.day}日"
             f"（周{_WEEKDAYS[now.weekday()]}）{now.hour:02d}:{now.minute:02d}")
 
@@ -224,32 +228,47 @@ class ContextManager:
         return "\n\n".join(out)
 
     def build_messages(self, system_prompt: str, activation: str = None,
-                       first_user_instr: str = None,
-                       pre_time: list = None) -> list:
+                       first_user_instr: str = None, pre_time: list = None,
+                       mid_static: list = None, now: datetime = None) -> list:
         """组装发往 LLM 的完整消息。
 
-        system + 合并条目（若有）+ 未合并历史（绝对时间标注）+ [pre_time
-        动态尾部段] + 当前时间（时间锚点）+ 指令附加。所有 time 字段剥离，
-        模型只见绝对时间标注。
-        当前时间锚点放在激活指令之前而非上下文开头：锚点内容逐请求动态
+        system + [mid_static 半动态段] + 合并条目（若有）+ 未合并历史（绝对
+        时间标注）+ [pre_time 动态尾部段] + 当前时间（时间锚点）+ 指令附加。
+        所有 time 字段剥离，模型只见绝对时间标注。
+
+        mid_static：半动态段（变化频率远低于回合级的静态段补充，如好感等级
+        规则/技能 world book——按设计预期一日不跨级）。按给定顺序插在静态
+        system 之后、中期记忆之前：日常请求它逐字节稳定、参与缓存前缀；
+        跨级（低频）时断点只落在本段，身份块与历史完全不受影响。
+        元素为字符串（自动包成 system 消息）或完整消息 dict。
+
+        now：当前时间锚点所用时刻。None = 调用时刻（datetime.now()）；
+        多轮工具循环应传入循环触发时刻，使整段前缀在循环内逐字节稳定。
+        当前时间锚点放在激活指令之前而非上下文开头：锚点内容随请求动态
         变化（「此刻是 …」分钟粒度），置于开头会在第二个消息处切断缓存
         前缀（静态在前、动态在后）；放后部既保住前缀，又贴近生成位置
         （近因效应），「以上对话消息」的说明放在被标注消息之后语义更顺。
         历史消息用绝对时间标注（abs_time_label，逐字节稳定）而非相对时间
         （相对标注会随请求时刻漂移、切断历史段缓存前缀）。
 
-        pre_time：高频变化的动态段（如【当前状态】/【对方正在…】/
-        【本回合推进】，见 llm.state_section / env_section / turn_section），
-        按给定顺序插在时间锚点之前——全部落在历史之后，使静态 system 段
-        与历史段成为稳定缓存前缀。元素为字符串（自动包成 system 消息）
-        或完整消息 dict。
+        pre_time：高频变化的动态段（如【对方正在…】/【本回合可用工具】/
+        【当前状态】/【本回合推进】，见 llm.env_section / tool_list_section /
+        state_section / turn_section），按给定顺序插在时间锚点之前——全部
+        落在历史之后，使静态 system 段、mid_static 段与历史段成为稳定缓存
+        前缀。元素为字符串（自动包成 system 消息）或完整消息 dict。
 
         first_user_instr：思维链风格指令，追加到第一条 user 历史消息末尾
         （紧贴用户首句，靠近模型生成位置）；若历史中还没有 user 消息
         （纯开场白回合），则作为独立【思维链风格】system 消息注入。
         """
-        now = datetime.now()
         msgs = [{"role": "system", "content": system_prompt}]
+        # mid_static 半动态段：静态之后、中期记忆之前（变化频率：等级规则
+        # 跨级才变 / 技能 world book 激活才变，均低于合并条目）。
+        for seg in mid_static or []:
+            if isinstance(seg, dict):
+                msgs.append(seg)
+            else:
+                msgs.append({"role": "system", "content": str(seg)})
         # 合并条目：更早历史的压缩（中期记忆层）
         # 措辞双重要求：明确「这是你的中期记忆」，同时保留防御语义——
         # 它是对更早对话的压缩，不是对方刚说的话，不要当作本回合发言来回应。
@@ -306,7 +325,7 @@ class ContextManager:
         # 位置（近因效应），说明文字用「以上」指向已出现的标注消息。
         msgs.append({
             "role": "system",
-            "content": f"【当前时间】{current_time_text()}。"
+            "content": f"【当前时间】{current_time_text(now)}。"
                        "以上对话消息的标注为绝对时间（如「08-14 23:50」），"
                        "可与当前时间比对推算距今多久。",
         })
@@ -426,6 +445,24 @@ def selftest() -> None:
     assert len(style_msgs) == 1 and style_msgs[0]["role"] == "system", msgs_open
     assert style_msgs[0]["content"].startswith("【思维链风格】"), style_msgs[0]
 
+    # mid_static 半动态段：静态 system 之后、中期记忆之前
+    msgs_mid = ctx.build_messages("SYS", mid_static=["段M1", "段M2"])
+    assert msgs_mid[0]["role"] == "system" and msgs_mid[0]["content"] == "SYS", msgs_mid
+    assert msgs_mid[1]["content"] == "段M1" and msgs_mid[2]["content"] == "段M2", msgs_mid
+    assert msgs_mid[1]["role"] == "system" and msgs_mid[2]["role"] == "system", msgs_mid
+    assert msgs_mid[3]["role"] == "user", "mid_static 之后才是历史"
+    assert msgs_mid[-1]["role"] == "system" and "【当前时间】" in msgs_mid[-1]["content"], \
+        "时间锚点仍在序列末尾（mid_static 不改变尾部布局）"
+    # now 冻结：传入固定时刻，时间锚点逐字节稳定（多轮工具循环复用同一时刻）
+    from datetime import datetime as _dt
+    fixed = _dt(2026, 8, 12, 22, 15, 0)
+    msgs_t1 = ctx.build_messages("SYS", now=fixed)
+    msgs_t2 = ctx.build_messages("SYS", now=fixed)
+    assert msgs_t1[-1]["content"] == msgs_t2[-1]["content"], "固定 now 时间锚点应逐字节稳定"
+    assert "此刻是 2026年8月12日（周三）22:15" in msgs_t1[-1]["content"], msgs_t1[-1]
+    assert current_time_text(fixed) == "此刻是 2026年8月12日（周三）22:15", current_time_text(fixed)
+    assert current_time_text(None), "now=None 应回退当前时刻"
+
     # 合并流程：超过阈值（keep_recent + keep_mid）才触发，合并后只留
     # keep_recent 条原文 + 1 条已合并（默认阈值 20 + 40 = 60，回落 20）
     ctx2 = ContextManager(rounds=30, keep_recent=2, keep_mid=2)  # 阈值 4
@@ -469,6 +506,10 @@ def selftest() -> None:
     assert "非对话内容" not in msgs3[1]["content"], "旧标注应替换"
     assert msgs3[-1]["role"] == "system" and "【当前时间】" in msgs3[-1]["content"], \
         "时间锚点应在序列末尾（激活指令之前）"
+    # mid_static 在合并条目之前：布局 SYS + mid_static + 合并条目 + 历史
+    msgs_mid2 = ctx2.build_messages("SYS", mid_static=["段M"])
+    assert "段M" in msgs_mid2[1]["content"] and "中期记忆" in msgs_mid2[2]["content"], \
+        "合并条目应在 mid_static 之后（半动态段比合并条目更稳定）"
 
     # 合并失败：不合并、本回合不重试、新输入后重试
     ctx3 = ContextManager(rounds=30, keep_recent=1, keep_mid=1)  # 阈值 2
