@@ -61,6 +61,24 @@ BUBBLE_BORDER = "#c9d8c9"
 ERR_COLOR = "#c0392b"
 BUBBLE_MAX_W = 340      # 气泡最大像素宽
 
+# 工具调用时的忙碌状态文字（占位版；动感文字渲染后续做，见 1.2 计划）
+_TOOL_STATUS = {
+    "think": "正在整理思绪…",
+    "update_state": "正在调整状态…",
+    "discover_running": "正在查看运行中的游戏…",
+    "start_game": "正在启动游戏…",
+    "read_current_text": "正在读取游戏画面…",
+    "query_wiki": "正在查阅藏书…",
+    "scan_game": "正在扫描游戏文本…",
+    "read_raw_text": "正在翻看原文…",
+    "wiki_arbitrate": "正在核对原文裁决…",
+    "wiki_rebuild": "正在重建词条…",
+    "rename_game": "正在为游戏起名…",
+    "query_archive": "正在翻找旧档案…",
+    "mora_notes": "正在翻看笔记…",
+    "say": "正在开口…",
+}
+
 # 查询类工具（意向-动作校验判定：说了要查但没调这些 → 触发重试）
 # 与游戏世界类工具（<game_data> 包裹回传）均派生自 tools.SPECS 注册表
 # （唯一来源，见 tools.query_names / tools.game_world_names）。
@@ -175,12 +193,14 @@ class MoraPet:
             self.ctx.merge = saved.get("merge")            # 恢复合并条目
             self.ctx.archives = list(saved.get("archives") or [])  # 恢复归档
             self._resume_gap = _resume_gap_text(saved.get("saved_at"))
+            self._fresh_session = False
         else:
             self.state = dict(initial_state)
             self.ctx = ContextManager(
                 rounds=int(CONFIG.get("history_rounds", 30)), opening=opening,
                 keep_recent=keep_recent, keep_mid=keep_mid)
             self._resume_gap = None
+            self._fresh_session = True   # 无存档：首次会话 → 开场白作为问候气泡展示
         self.sys_prompt = build_system_prompt(self.card, state=self.state)
 
         self._sprite_img = None
@@ -199,6 +219,8 @@ class MoraPet:
         self._approve_later_rect = None # 稍后按钮区域
         self._input_win = None
         self._busy = False
+        self._status_win = None       # 忙碌状态提示窗（工具调用/等待时显示「她在做什么」）
+        self._status_lbl = None
         self._drag_off = (0, 0)
         self._click_job = None
         self._last_messages = []      # 本回合实际发送给 LLM 的完整消息（供日志）
@@ -467,6 +489,7 @@ class MoraPet:
         self._sync_followers()
 
     def _on_release(self, event):
+        self._place_status_win()   # 拖动结束：状态窗跟随重定位
         if self._click_job is not None:
             self.root.after_cancel(self._click_job)
             self._click_job = None
@@ -698,6 +721,7 @@ class MoraPet:
             self.ctx.ensure_merged(self._merge_history)
             for turn in range(1, max_turns + 1):
                 retried_this_turn = False
+                self._set_status("正在思考…")
                 # 每轮重建 system prompt：只含静态段（身份/性格/情境/记忆/
                 # 等级规则/技能/协议）；动态段（状态/环境/推进）作为独立
                 # system 消息注入历史之后（pre_time），静态段与历史段因此
@@ -921,6 +945,7 @@ class MoraPet:
                     if c["name"] in _QUERY_TOOL_NAMES or c["name"] == "query_archive":
                         self._queried_before = True   # 已实际调用过查询工具
                         self._queried_count += 1      # 本输入内查询调用计数（重复查询校验）
+                    self._set_status(_TOOL_STATUS.get(c["name"], "正在忙碌…"))
                     result = self._tool_result(c)     # 执行工具（副作用）
                     agent_msgs.append({               # tool 角色消息：协议必需配对
                         "role": "tool",
@@ -980,6 +1005,7 @@ class MoraPet:
                              fg=self.speech_color, bg=BUBBLE_BG, typewriter=True)
         persist.save_session(self.state, self.ctx.history,
                              self.ctx.merge, self.ctx.archives)   # 回合结束落盘
+        self._set_status("")
         self._busy = False
 
     def _merge_history(self, to_merge: list, old_merge: dict) -> str or None:
@@ -1048,6 +1074,7 @@ class MoraPet:
             self.root.after(0, self._bounce)
 
     def _show_error(self, msg: str):
+        self._set_status("")
         self._request_bubble("⚠️ " + msg, fg=ERR_COLOR, bg="#fdf0ef")
         self._busy = False
 
@@ -1114,6 +1141,49 @@ class MoraPet:
                 self._bubble_after = self.root.after(16, lambda: step(i + 1))
 
         step()
+
+    # ------------------------------------------------------------------ 状态提示
+
+    def _set_status(self, text: str):
+        """忙碌状态文字（后台线程调用安全，经 after 调度回 UI 线程）。
+
+        工具调用/LLM 等待期间显示「她在做什么」；空串隐藏。占位版为
+        简单文字，动感文字渲染后续做（docs/1.2_USABILITY_PLAN.md）。
+        """
+        self.root.after(0, lambda: self._status_ui(text))
+
+    def _status_ui(self, text: str):
+        if not text:
+            if self._status_win is not None and self._status_win.winfo_exists():
+                self._status_win.destroy()
+            self._status_win = None
+            self._status_lbl = None
+            return
+        if self._status_win is None or not self._status_win.winfo_exists():
+            self._status_win = tk.Toplevel(self.root)
+            self._status_win.overrideredirect(True)
+            self._status_win.attributes("-topmost", True)
+            self._status_win.configure(bg="#2b2b2b")
+            self._status_lbl = tk.Label(
+                self._status_win, text="", fg="#f0f0f0", bg="#2b2b2b",
+                font=("Microsoft YaHei UI", 9), padx=10, pady=4,
+                highlightthickness=1, highlightbackground="#555555")
+            self._status_lbl.pack()
+        self._status_lbl.config(text=text)
+        self._place_status_win()
+
+    def _place_status_win(self):
+        """状态窗定位：桌宠窗口正上方居中；贴顶则改放其下方。"""
+        if self._status_win is None or not self._status_win.winfo_exists():
+            return
+        self._status_win.update_idletasks()
+        w = self._status_win.winfo_reqwidth()
+        h = self._status_win.winfo_reqheight()
+        x = self.root.winfo_x() + (self.w - w) // 2
+        y = self.root.winfo_y() - h - 8
+        if y < 0:
+            y = self.root.winfo_y() + self.h + 8
+        self._status_win.geometry(f"+{x}+{y}")
 
     def _bubble_text(self, text: str, fg: str, bg: str, typewriter: bool = False):
         if self._bubble is None or not self._bubble.winfo_exists():
@@ -1367,22 +1437,33 @@ class MoraPet:
             self._arm_auto_chat()   # 用新间隔重新计时
 
     def _greet(self):
-        """启动问候：调用 LLM 生成一句开场问候（气泡显示，走完整对话流程）。
+        """启动问候：首次会话先展示角色卡开场白（含帮助/能力说明）气泡，
+        随后调用 LLM 生成一句续接问候；恢复存档后重启只走 LLM 问候
+        （消息里附距上次对话的时间流逝，让角色感知时间间隔）。
 
-        与 auto_chat 同模式：注入一条 user 角色的伪消息触发 _request_llm，
-        最终台词经 _finish_agent 显示。问候台词会留在对话历史中，
-        作为后续对话的上下文起点。
-        恢复存档后重启：在消息里附上距上次对话的时间流逝（如
-        （距上次对话 3 小时）*对方看向了你*），让角色感知时间间隔。
+        开场白同时是上下文起始（opening），气泡展示与历史一致；
+        问候台词会留在对话历史中，作为后续对话的上下文起点。
         """
         if not CONFIG.get("greet_on_start", True) or self._busy:
             return
-        self._busy = True
+        opening = self.char.opening if getattr(self, "_fresh_session", False) else []
+        for line in opening[:6]:
+            if line.strip():
+                self._request_bubble(line.strip(), fg=self.speech_color,
+                                     bg=BUBBLE_BG, typewriter=True)
         gap = getattr(self, "_resume_gap", None)
         if gap:
             self.ctx.add_user(f"（{gap}）*{USER_REFERENCE}看向了你*")
         else:
             self.ctx.add_user(f"*{USER_REFERENCE}看向了你*")
+        # 开场白气泡按完整生命周期排队展示；LLM 问候在其后加入同一队列
+        delay = 900 + len(opening) * 1500 if opening else 0
+        self.root.after(delay, self._start_greet_llm)
+
+    def _start_greet_llm(self):
+        if self._busy:
+            return
+        self._busy = True
         threading.Thread(target=self._request_llm, daemon=True).start()
 
     def _auto_chat(self):

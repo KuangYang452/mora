@@ -134,7 +134,24 @@ profile.ini + sprite.png + prototype.json）。
 `description` 按顶层小节提取关键字段、从 `first_mes` 提取场景与开场台词，生成
 模板；已有 `identity.json` 时保留人工精调、仅校验角色名一致性。
 
-## 快速开始
+## 快速开始（下载即用）
+
+```text
+双击 启动莫拉.lnk        # 根目录便携快捷方式（带图标，pythonw 无黑窗）
+```
+
+首次使用流程（全程图形界面，无需命令行）：
+
+1. **启动控制台**：双击仓库根目录的 `启动莫拉.lnk`（等价双击 `start_pet.vbs`，
+   也可 `python launcher.py`；需已装 Python 3.10+，勾选 Add to PATH）；
+2. **装依赖**：启动页若提示缺少 `requests / pillow`，点「一键安装」；
+3. **填配置**：首次运行会自动跳到「配置」页，填写 LLM 的 API 地址 / Key / 模型
+   （应用、用户配置也有对应表单，保存后 app.ini 需重启桌宠生效）；
+4. **启动桌宠**：回到「启动」页点「🚀 启动桌宠」；
+5. **游戏入库**：在「游戏库」页选择游戏目录或 Game.exe，扫描后勾选入库即可
+   （之后桌宠即可读取该游戏文本与查询 wiki）。
+
+手动方式（等价，供脚本化/排障）：
 
 ```bash
 pip install requests pillow            # 基本依赖（OCR 另需 pytesseract + Tesseract）
@@ -142,7 +159,8 @@ copy setting\llm.ini.example setting\llm.ini   # 填写 base_url / api_key / mod
 copy setting\app.ini.example setting\app.ini
 copy setting\user.ini.example setting\user.ini
 python llm.py                          # 离线自测（无需 API Key）
-python pet.py                          # 启动桌宠
+python launcher.py --selftest          # 控制台自检
+python pet.py                          # 直接启动桌宠（跳过控制台）
 ```
 
 ## 配置（setting/）

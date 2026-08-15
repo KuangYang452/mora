@@ -1,0 +1,7 @@
+# 基础依赖（launcher 可一键安装：python -m pip install -r requirements.txt）
+requests
+pillow
+
+# 可选：OCR（游戏文本读取降级通道，rmgame_cdp_enabled=false 时用）
+# 需另装系统 Tesseract OCR（含 chi_sim 语言包）
+# pytesseract

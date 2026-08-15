@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """游戏发现与注册 —— rmgame/discovery
 
 职责：
@@ -51,6 +51,7 @@ class GameInfo:
     trust: str = "user"   # 信任级别：user（人工确认，可启动）| auto（自动发现，禁启动）
     last_seen: str = ""   # 运行中发现时间（自动入库）；人工入库可空
     aliases: list = field(default_factory=list)  # 可匹配名称（自动采集：引擎标题/目录名/父目录名）
+    name_manual: bool = False  # 显示名是否人工命名（True 时重扫/自动发现不覆盖，新检测名并入别名）
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -60,11 +61,12 @@ class GameInfo:
         kwargs = {k: d.get(k) for k in
                   ("slug", "name", "exe_path", "dir", "engine",
                    "data_dir", "version", "added_at", "launch_mode",
-                   "trust", "last_seen", "aliases")}
+                   "trust", "last_seen", "aliases", "name_manual")}
         kwargs["launch_mode"] = kwargs.get("launch_mode") or "auto"  # 旧库缺字段 → auto
         kwargs["trust"] = kwargs.get("trust") or "user"      # 旧库缺字段 → user（历史均为人工入库）
         kwargs["last_seen"] = kwargs.get("last_seen") or ""
         kwargs["aliases"] = list(kwargs.get("aliases") or [])
+        kwargs["name_manual"] = bool(kwargs.get("name_manual", False))  # 旧库缺字段 → False
         return cls(**kwargs)
 
 
@@ -311,9 +313,16 @@ def register(games: list, replace: bool = False) -> list:
         old = by_dir.get(g.dir)
         if old is not None:
             # 已入库：仅刷新显示名与别名（slug 稳定）
-            if old.name != g.name or old.aliases != g.aliases:
+            # 手动命名条目（name_manual）不被自动检测名覆盖；新检测名并入别名
+            if not old.name_manual and old.name != g.name:
                 old.name = g.name
-                old.aliases = g.aliases
+            if not old.name_manual:
+                if old.aliases != g.aliases:
+                    old.aliases = g.aliases
+            else:
+                for a in [g.name] + list(g.aliases or []):
+                    if a and a != old.name and a not in old.aliases:
+                        old.aliases.append(a)
             continue
         if g.slug in by_slug:
             continue  # 同 slug 其他目录已入库（防重）
@@ -337,10 +346,22 @@ def auto_register(info: GameInfo) -> bool:
         if g.slug == info.slug:
             return False  # 已入库（不论 trust），不覆盖不降级
         if g.dir == info.dir:
-            # 同目录已入库：仅刷新更权威的 name / aliases（slug 稳定）
-            if g.name != info.name or g.aliases != info.aliases:
+            # 同目录已入库：仅刷新更权威的 name / aliases（slug 稳定）；
+            # 手动命名条目（name_manual）不被自动名覆盖，新检测名并入别名
+            changed = False
+            if not getattr(g, "name_manual", False) and g.name != info.name:
                 g.name = info.name
-                g.aliases = info.aliases
+                changed = True
+            if not getattr(g, "name_manual", False):
+                if g.aliases != info.aliases:
+                    g.aliases = info.aliases
+                    changed = True
+            else:
+                for a in [info.name] + list(info.aliases or []):
+                    if a and a != g.name and a not in g.aliases:
+                        g.aliases.append(a)
+                        changed = True
+            if changed:
                 save_games(games)
             return False
     now = _dt.datetime.now().isoformat(timespec="seconds")
@@ -369,3 +390,89 @@ def approve(slug: str):
     g.trust = "user"
     save_games(games)
     return g, f"《{g.name}》已确认（trust=user），角色现在可以启动它了。"
+
+
+# ---------------------------------------------------------------------------
+# 改名（角色命名 / 用户改名统一入口）
+# ---------------------------------------------------------------------------
+
+def _sync_dir_meta(meta_path: Path, new_slug: str, new_name: str) -> None:
+    """同步 raw/meta.json 与 wiki/index.json 内嵌的 slug/name（迁移后自洽）。"""
+    if not meta_path.is_file():
+        return
+    try:
+        data = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, OSError):
+        return
+    if isinstance(data, dict) and ("slug" in data or "name" in data):
+        data["slug"] = new_slug
+        data["name"] = new_name
+        meta_path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+
+
+def _migrate_slug_dirs(old_slug: str, new_slug: str, new_name: str) -> None:
+    """迁移 slug 数据目录：raw/<old> / wiki/<old> / event_summary/<old> → 新 slug。
+
+    先校验全部迁移目标空闲（避免部分迁移），再执行目录重命名，最后同步
+    meta.json / index.json 内嵌字段。无数据目录时零操作。
+    """
+    pairs = []
+    for base in (RAW_DIR, WIKI_DIR):
+        src = base / old_slug
+        if src.is_dir():
+            dst = base / new_slug
+            if dst.exists():
+                raise RuntimeError(f"迁移目标已存在: {dst}")
+            pairs.append((src, dst))
+    es = RUNTIME_DIR / "event_summary"
+    src = es / old_slug
+    if src.is_dir():
+        dst = es / new_slug
+        if dst.exists():
+            raise RuntimeError(f"迁移目标已存在: {dst}")
+        pairs.append((src, dst))
+    for src, dst in pairs:
+        src.rename(dst)
+    _sync_dir_meta(RAW_DIR / new_slug / "meta.json", new_slug, new_name)
+    _sync_dir_meta(WIKI_DIR / new_slug / "index.json", new_slug, new_name)
+
+
+def rename_game(key: str, new_name: str) -> tuple:
+    """改名（角色命名 / 用户改名统一入口）：更新 games.json + 按需迁移数据目录。
+
+    - key 按 slug / name / aliases 匹配库中条目；新名非空；
+    - 新 slug = make_slug(new_name)；与库中其他游戏（不同目录）slug 冲突 → 拒绝；
+    - 旧名并入 aliases（保匹配）；name_manual=True（重扫/自动发现不覆盖）；
+    - raw/ wiki/ runtime/event_summary/ 下旧 slug 目录存在则整体迁移到新 slug，
+      并同步 meta.json / index.json 内嵌的 slug / name；无数据目录时零成本。
+    返回 (GameInfo | None, 消息文本)。
+    """
+    new_name = (new_name or "").strip()
+    if not new_name:
+        return None, "新名称不能为空。"
+    games = load_games()
+    g = next((x for x in games if x.slug == key or x.name == key), None)
+    if g is None:
+        g = next((x for x in games if key in getattr(x, "aliases", [])), None)
+    if g is None:
+        return None, f"游戏库中无「{key}」。"
+    if new_name == g.name:
+        return g, f"《{g.name}》名称未变化，无需改名。"
+    new_slug = make_slug(new_name)
+    if new_slug != g.slug:
+        for other in games:
+            if other is not g and other.slug == new_slug:
+                return None, (f"改名冲突：库中已有《{other.name}》使用标识"
+                              f"「{new_slug}」，请换一个名称。")
+        try:
+            _migrate_slug_dirs(g.slug, new_slug, new_name)
+        except RuntimeError as exc:
+            return None, f"改名中止（数据目录迁移失败）：{exc}"
+    if g.name not in g.aliases:
+        g.aliases.append(g.name)
+    g.name = new_name
+    g.slug = new_slug
+    g.name_manual = True
+    save_games(games)
+    return g, f"《{new_name}》已改名（标识 {new_slug}）"

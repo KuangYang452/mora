@@ -14,6 +14,7 @@
 
 import ctypes
 import ctypes.wintypes as wt
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageGrab
@@ -66,11 +67,12 @@ def _cmdline_pids_contain(game_dir: str) -> set:
     try:
         import json
         import subprocess
+        _no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # pythonw 下防控制台闪窗
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"Name='nw.exe' OR Name='Game.exe'\" | "
              "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10, creationflags=_no_window)
         data = json.loads(out.stdout or "[]")
         items = data if isinstance(data, list) else [data] if data else []
         for it in items:
@@ -259,7 +261,16 @@ def ocr_image_tesseract(img: Image.Image, lang: str = "chi_sim+eng") -> str:
             "Tesseract OCR 需要 pytesseract：pip install pytesseract")
     try:
         pytesseract.pytesseract.tesseract_cmd = _find_tesseract_cmd()
-        return (pytesseract.image_to_string(img, lang=lang) or "").strip()
+        kwargs = {}
+        if sys.platform == "win32":
+            import subprocess
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            # tesseract.exe 是控制台程序：pythonw 无控制台环境下会闪窗，
+            # 用 CREATE_NO_WINDOW 抑制；旧版 pytesseract 不接受该参数则回退。
+            return (pytesseract.image_to_string(img, lang=lang, **kwargs) or "").strip()
+        except TypeError:
+            return (pytesseract.image_to_string(img, lang=lang) or "").strip()
     except Exception as exc:
         raise OcrUnavailableError(f"Tesseract 不可用: {exc}")
 

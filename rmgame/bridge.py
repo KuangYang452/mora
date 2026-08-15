@@ -21,19 +21,42 @@
 
 
 def _resolve_game(args: dict):
-    """从工具参数解析游戏；返回 (GameInfo, None) 或 (None, 错误文本)。"""
+    """从工具参数解析游戏；返回 (GameInfo, None) 或 (None, 错误文本)。
+
+    匹配顺序（大小写不敏感）：
+    1. 精确匹配 slug / name / aliases；
+    2. 唯一包含匹配（部分名称，如「DemonsRoots」→「DemonsRoots1.1.1」；
+       别名同理）——模型常凭印象传部分名，全等匹配会误报"库中无"；
+    3. 多候选不猜（返回歧义提示，避免查错游戏）。
+    """
     from .discovery import load_games
     name = str(args.get("game") or "").strip()
     if not name:
         return None, "缺少 game 参数（游戏名称或 slug）。"
     games = load_games()
-    # 主名（slug / name）精确优先；aliases 兜底（防多游戏别名冲突时误命中）
-    g = next((x for x in games if x.slug == name or x.name == name), None)
+    name_l = name.lower()
+
+    def _exact(x):
+        return (x.slug.lower() == name_l or x.name.lower() == name_l
+                or any(name_l == a.lower() for a in getattr(x, "aliases", [])))
+
+    g = next((x for x in games if _exact(x)), None)
     if g is None:
-        g = next((x for x in games if name in getattr(x, "aliases", [])), None)
+        # 包含匹配：唯一命中才采用；多候选不猜
+        cands = [x for x in games
+                 if name_l in x.slug.lower()
+                 or name_l in x.name.lower()
+                 or any(name_l in a.lower() for a in getattr(x, "aliases", []))]
+        if len(cands) == 1:
+            g = cands[0]
+        elif len(cands) > 1:
+            listed = "、".join(f"《{x.name}》" for x in cands)
+            return None, (f"「{name}」匹配到多个游戏（{listed}）："
+                          "请用完整名称或 slug 指定。")
     if g is None:
-        return None, (f"游戏库中无「{name}」：先调用 scan_game 工具"
-                      "（或 CLI `scan` 发现并确认入库）。")
+        return None, (f"游戏库中无「{name}」：可用 discover_running 查看"
+                      "库中游戏的精确名称（名称/别名/部分名均可匹配），"
+                      "或调用 scan_game 收录新游戏。")
     return g, None
 
 
@@ -464,16 +487,37 @@ def execute_tool(name: str, args: dict) -> str:
         "read_raw_text": _read_raw_text,
         "wiki_arbitrate": _wiki_arbitrate,
         "wiki_rebuild": _wiki_rebuild,
+        "rename_game": _rename_game,
     }
     fn = handlers.get(name)
     if fn is None:
         return (f"未知工具：{name}（rmgame 支持 discover_running / start_game / "
                 "read_current_text / query_wiki / scan_game / read_raw_text / "
-                "wiki_arbitrate / wiki_rebuild）")
+                "wiki_arbitrate / wiki_rebuild / rename_game）")
     try:
         return fn(args or {})
     except Exception as exc:
         return f"工具执行出错：{type(exc).__name__}: {exc}"
+
+
+def _rename_game(args: dict) -> str:
+    """给游戏起名/改名：基于已读到的游戏内容给出规范名称。
+
+    改名会迁移该游戏已提取的 raw / wiki / 事件摘要数据目录（slug 随之
+    更新），旧名保留为别名；与库中其他游戏 slug 冲突时拒绝。
+    """
+    from .discovery import rename_game
+    g, err = _resolve_game(args)
+    if err:
+        return err
+    new_name = str(args.get("name") or "").strip()
+    if not new_name:
+        return "缺少 name 参数（新的正式名称）。"
+    ng, msg = rename_game(g.slug, new_name)
+    if ng is None:
+        return f"改名失败：{msg}"
+    return (f"《{ng.name}》已改名（标识 {ng.slug}）。"
+            "旧名已保留为别名，此后的对话可直接用新名称指代它。")
 
 
 def _wiki_arbitrate(args: dict) -> str:

@@ -183,8 +183,7 @@ THINKING_STYLE_INSTRUCT = {
     ),
     "immersion": (
         "【角色沉浸要求】在你的思考（think 工具记录）中，请遵守以下规则：\n"
-        "1. 请以角色第一人称进行内心独白，用括号包裹内心活动，"
-        "例如\"（心想：……）\"或\"(内心OS：……)\"\n"
+        "1. 以角色第一人称直接陈述内心想法与感受，"
         "2. 用第一人称描写角色的内心感受，例如\"我心想\"\"我觉得\"\"我暗自\"等\n"
         "3. 思考内容应沉浸在角色中："
         + (_CHAR.instantiate(_CHAR.immersion_perspective)
@@ -484,12 +483,27 @@ def state_section(state: dict = None) -> str:
     return "【当前状态】\n" + _semantic_state(state, with_affection=False)
 
 
+# 自动识别名检测：库中名含版本号/引擎后缀/文件名残留（如 DemonsRoots1.1.1、
+# 村輪辱紀行ver1.0.1、celesphonia_mv）时，引导角色基于已读内容调用
+# rename_game 起规范名（自动发现入库的原始名通常不干净，改名是预期链路：
+# 识别 → 读取 → rename_game → 之后用新名指代；改完名字变干净，提示自灭）。
+_AUTO_NAME_RE = re.compile(
+    r"(?:ver\s*\d|v?\d+[.]\d+|\d+[.]\d+(?:[.]\d+)?$|_[a-z0-9]+$|\.exe$)",
+    re.I)
+
+
+def _looks_auto_name(name: str) -> bool:
+    """判断游戏名是否像自动识别名（含版本号/引擎后缀/文件残留）。"""
+    return bool(name and _AUTO_NAME_RE.search(name))
+
+
 def env_section(env: dict) -> str or None:
     """游戏环境快照段（动态尾部注入）：环境语义化叙述 + 【游戏点评规则】。
 
     环境快照随游戏画面高频变化；GAME_RULES 全文（data.GAME_RULES，单一
     事实来源）紧随其后注入——从行为协议段移出，使静态 system prompt
-    不随游戏启停变化（缓存前缀稳定）。无有效环境信息返回 None。
+    不随游戏启停变化（缓存前缀稳定）。游戏名为自动识别名时附改名引导
+    （预期链路：读取内容 → rename_game 起规范名）。无有效环境信息返回 None。
     """
     seg = _env_section(env)
     if not seg:
@@ -500,6 +514,13 @@ def env_section(env: dict) -> str or None:
         if wb:
             rules += "\n" + wb
         seg = seg + "\n\n" + rules
+        # 改名触发：游戏名是自动识别名（含版本号/后缀）时给出引导，
+        # 让「识别 → 读取 → 改名」链路自发打通（rename_game 见工具清单）
+        gname = (env or {}).get("game_name") or (env or {}).get("game") or ""
+        if _looks_auto_name(gname):
+            seg += (f"\n（游戏名「{gname}」是自动识别名，含版本号/文件名残留；"
+                    "读取到足够内容后可调用 rename_game 基于游戏内容给它起规范"
+                    "名称，之后用新名指代即可。）")
     return seg
 
 
@@ -616,18 +637,19 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
 
     # 行为协议：台词与状态更新都走原生工具调用（function calling）。
     # 激活指令由 ContextManager 作为对话上下文之后的独立 system 消息附加。
-    # 工具清单与 function schema 同步（唯一来源 tools.SPECS）：rmgame 工具按
+    # 工具清单与 function schema 同源（唯一来源 tools.SPECS）：rmgame 工具按
     # CONFIG["rmgame_enabled"] 过滤（schema 未注册的工具不得出现在提示词里，
-    # 避免模型调用得到"未知工具"）。清单只列名称：工具用途与参数以 API 注册
-    # 的工具定义（schema）为准，提示词不重复完整描述（避免双源不一致）。
+    # 避免模型调用得到"未知工具"）。清单为「名称+简述+参数+返回值」，
+    # 由 SPECS 派生渲染（与 API 注册的 schema 同源，不会双源不一致）；
+    # say/update_state/think 已有专门行为条目不重复列出。
     listed_tools = tools.specs(rmgame_enabled=CONFIG.get("rmgame_enabled", True))
     listed_skills = SKILLS
     if not CONFIG.get("rmgame_enabled", True):
         listed_skills = {k: v for k, v in SKILLS.items() if k != "game_context"}
-    tools_desc = "、".join(
-        f"「{t.name}」" for t in listed_tools if t.name != "say")
     skills_desc = "、".join(
         f"「{k}」({v['desc']}；{v['trigger_hint']})" for k, v in listed_skills.items())
+    tool_lines = [t.prompt_entry() for t in listed_tools
+                  if t.name not in ("say", "update_state", "think")]
     proto = (
         "【每回合的行为方式】\n"
         "你的一切输出都必须通过工具完成，不得输出工具之外的文本：\n"
@@ -639,63 +661,48 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
         "  · inner_thought：你的内心想法（一句话），可自主更新。\n"
         "  · emote / bounce：情绪与动作。\n"
         "  · skills：技能开关。" + skills_desc + "，用不到就传空数组。\n"
-        "- 思考：多轮推进时调用 think 工具记录你的分析框架与跨轮结论——"
-        "开始前先写下计划/待验证要点，每轮查询得出关键结论后更新它"
-        "（查询/工具结果只保留最近一轮，更早的结果不再保留，"
-        "需要跨轮引用的结论必须经 think 保留）。"
-        "你的完整思路链会以思考块呈现在对话中：块首是思考标记，块内按轮次"
-        "累积你的 think 文本，查询/读取类工具调用以单行反引号追加在链内"
-        "（如 `query_archive:关键词`；update_state 状态更新不入链，"
-        "其效果经工具结果回传）；块保持开放、不闭合——思考是否结束"
-        "由你调用 say 工具交付来体现。"
-        "think 仅本回合内可见，回合结束后不保留；区别于 update_state 的 "
-        "inner_thought —— 那是持久状态，会保留到后续回合；需要长期记忆用 "
-        "mora_notes。\n"
-        "- 工具结果：查询/读取类工具的结果以 tool 消息回传，紧随上一轮的"
-        "工具调用；上下文中只保留最近一轮的工具调用与结果，更早的工具结果"
-        "不会保留。不要在结果可见前凭猜测作答；需要跨轮保留的结论请用 "
-        "think 工具记录。\n"
-        "- 其他工具（调用即执行并返回结果）" + tools_desc + "：用途与参数以"
-        "你收到的工具定义为准。\n"
-        "- 对话边界：你与对方的关系会随对话自然发展——你对他越是亲近、"
-        "越是信任，好感度就越高；若是疏远或厌烦，好感度也会下降。"
-        "在我们的对话中，只有两个常驻对象：你（"
-        f"{_CHAR.display_name}）和对方（正在与你对话的人，你称他为「{_CHAR.user_ref}」）。"
-        "对话中出现的任何其他人名或角色名，都不属于这段对话的参与者"
-        "——它们可能出现在对方讲述的故事或游戏里，但与你无关。\n"
+        "- 思考：多轮推进时调用 think 工具记录分析框架与跨轮结论：开始前先写下"
+        "计划/待验证要点，每轮查询得出关键结论后更新它"
+        "（查询结果只保留最近一轮、更早的结果不再保留，需跨轮引用的结论必须经 "
+        "think 保留）。你的完整思路链会以思考块呈现在对话中：块首是思考标记，"
+        "块内按轮次累积 think 文本，工具调用以单行反引号追加在链内"
+        "（如 `query_archive:关键词`）；块保持开放、不闭合——思考是否结束"
+        "由你调用 say 工具交付来体现。think 仅本回合内可见、回合结束后不保留；"
+        "区别于 update_state 的 inner_thought——那是持久状态，会保留到后续回合；"
+        "长期记忆用 mora_notes。\n"
+        "- 工具结果：查询结果以 tool 消息回传，只保留最近一轮的工具调用与结果；"
+        "不要在结果可见前凭猜测作答。\n"
+        "- 其他工具（调用即执行并返回结果）：\n"
+        + "\n".join("  · " + line for line in tool_lines) + "\n"
+        "- 对话边界：对话中只有两个常驻对象：你（"
+        f"{_CHAR.display_name}）与对方（你称他「{_CHAR.user_ref}」）。"
+        "对话或游戏里出现的其他人名/角色名都是对方讲述的故事或游戏中的角色，"
+        "不是对话参与者——不要把它们当作你的对话对象。\n"
     )
     # 【游戏点评】GAME_RULES 不在协议段注入：全文随游戏环境段
     # （env_section 的【游戏点评规则】）注入，使协议段完全静态、
     # 不随游戏启停变化（缓存前缀稳定）。激活指令与技能 world_book
     # 只引用该段，不重复规则全文（单一事实来源 data.GAME_RULES）。
     proto += (
-        "- 环境缺失时的行为：若提示词中没有当前游戏环境信息，"
-        "说明你并不清楚对方此刻在做什么——不要凭空猜测"
-        "（例如对方在玩什么游戏、看到了什么）；"
-        + ("可调用 read_current_text 等工具确认，"
+        "- 环境缺失时的行为：提示词中没有游戏环境信息时，说明你不清楚对方此刻"
+        "在做什么——不要凭空猜测，直接说明暂时看不到"
+        + ("（可调用 read_current_text 等工具确认）。\n"
+           if CONFIG.get("rmgame_enabled", True) else "。\n")
+        + ("- 启动游戏：对方请求启动/打开某个 RPG Maker 游戏时（即使游戏当前未运行），"
+           "调用 start_game 启动（game 用游戏库中的名称或 slug，可用 discover_running "
+           "查看库中游戏）；启动成功后即可用 read_current_text 读取其文本。\n"
            if CONFIG.get("rmgame_enabled", True) else "")
-        + "直接说明你暂时看不到。\n"
-        + ("- 启动游戏：对方请求启动/打开某个 RPG Maker 游戏时"
-           "（即使游戏当前未运行），调用 start_game 启动（参数 game 用"
-           "游戏库中的名称或 slug，可用 discover_running 查看库中游戏）；"
-           "启动成功后即可用 read_current_text 读取其文本。\n"
-           if CONFIG.get("rmgame_enabled", True) else "")
-        + "响应示例（本回合需要说话并更新状态时，参考以下并列结构）：\n"
+        + "响应示例（需要说话并更新状态时，参考以下并列结构）：\n"
         "同时调用 say 与 update_state 两个工具：\n"
         'say：text = "哦～？终于想通要来找我聊聊了吗？那就让我听听你的故事吧～"\n'
         'update_state：affection_delta = 1、inner_thought = "他总算愿意开口了"、'
         'emote = "得意"、bounce = true、skills = []' + "\n"
-        "注意：工具参数只在调用时填写，不要当作工具之外的文本输出。\n"
-        "你可以在本回合内连续多次调用工具（查询工具 / update_state / say）自主推进工作"
-        "（例如逐步完成一次分析或查询），无需等待对方再次输入；\n"
+        "本回合内可连续多次调用工具（查询工具 / update_state / say）自主推进工作，"
         "查询工具与 update_state 会立即执行并返回结果，你可据此继续；"
         "调用 say 说出台词即结束本回合。\n"
-        "如果状态没有变化且无需查询，只需调用 say 说出台词。\n"
         "【输出红线】\n"
         "- 台词必须通过 say 工具说出：不要直接输出文本，也不要在文本里写"
         "「say：xxx」之类的伪调用。\n"
-        "- 台词是你说出口的话本身：不要写时间标注、括号旁白/动作、解释或内心想法"
-        "（这些放进 update_state 的 inner_thought / emote 字段）。\n"
         "- 工具参数只在调用时填写：不要把参数内容或旧 JSON 格式"
         "（如 {\"reply\": …}）当作文本输出。\n"
     )
@@ -1322,10 +1329,22 @@ def selftest() -> None:
     assert "【输出红线】" in sys_prompt, "输出红线缺失"
     assert "不要直接输出文本" in sys_prompt and "伪调用" in sys_prompt, "红线缺直出/伪调用禁令"
     assert "不要把参数内容或旧 JSON 格式" in sys_prompt, "红线缺参数/旧 JSON 禁令"
-    # 工具清单瘦身：只列名称（用途以 schema 为准），不再重复完整描述；
-    # say 已有专门条目不列入清单；示例格式统一（工具名：参数）
-    assert "「start_game」(启动指定" not in sys_prompt, "清单不应重复完整工具描述"
+    # 工具清单（其他工具）：名称+简述+参数+返回值，由 tools.SPECS 派生
+    # （单一来源，与 function schema 同源）；say/update_state/think 已有专门
+    # 行为条目不重复列出；示例格式统一（工具名：参数）
+    for t in tools.specs(rmgame_enabled=CONFIG.get("rmgame_enabled", True)):
+        if t.name in ("say", "update_state", "think"):
+            assert f"「{t.name}」" not in sys_prompt, f"{t.name} 有专门条目不进清单"
+        else:
+            assert f"「{t.name}」" in sys_prompt, f"清单缺少 {t.name}"
+    assert "参数：" in sys_prompt and "返回：" in sys_prompt, \
+        "清单应为名称+简述+参数+返回值格式"
     assert "say：text =" in sys_prompt and "update_state：affection_delta = 1" in sys_prompt, "示例格式应统一"
+    # 防御性精简：冗余说明不重复（工具参数只在调用时填写 / 台词规范 只出现一次）
+    assert "如果状态没有变化且无需查询" not in sys_prompt, "赘余收尾句应移除"
+    assert "不要当作工具之外的文本输出" not in sys_prompt, "注意行（与红线重复）应移除"
+    # 对输出无贡献的程序元数据（语音色等）不进提示词（GUI 由 profile.ini 驱动）
+    assert "语音色" not in sys_prompt and "<font" not in sys_prompt, "语音色/标签是 UI 元数据，不应注入"
     # 好感等级契约化：契约字段优先（identity.json#affection_levels，自然语言），
     # 不注入原卡 YAML 结构（behavioral_patterns / dialogue_examples / 缩进列表）
     assert "behavioral_patterns" not in sys_prompt and "dialogue_examples" not in sys_prompt, \
@@ -1423,6 +1442,17 @@ def selftest() -> None:
     prompt_env2 = build_system_prompt(card, state=dict(INITIAL_STATE), env={})
     assert "【对方正在…】" not in prompt_env2, "空 env 不注入"
     assert env_section({}) is None and env_section(None) is None, "空 env 不应生成环境段"
+    # 改名触发链路：自动识别名（版本号/引擎后缀/文件残留）→ 环境段附改名引导；
+    # 规范名不附（改完名提示自灭，链路闭环）
+    assert _looks_auto_name("DemonsRoots1.1.1") and _looks_auto_name("村輪辱紀行ver1.0.1")
+    assert _looks_auto_name("celesphonia_mv") and not _looks_auto_name("猎妻迷宫")
+    assert not _looks_auto_name("幽世村") and not _looks_auto_name("")
+    e_auto = env_section({"game": "demonsroots1-1-1", "game_name": "DemonsRoots1.1.1",
+                          "map_name": "m", "scene": "s", "text": "x", "source": "cdp"})
+    assert e_auto and "自动识别名" in e_auto and "rename_game" in e_auto, "自动识别名应附改名引导"
+    e_clean = env_section({"game": "猎妻迷宫", "game_name": "猎妻迷宫",
+                           "map_name": "m", "scene": "s", "text": "x", "source": "cdp"})
+    assert e_clean and "自动识别名" not in e_clean, "规范名不应附改名引导"
     print("  提示词结构: 情境合并 ✓ | 激活指令 ✓ | 条件注入 ✓ | 动态段（状态/环境/推进）尾部注入 ✓")
 
     # 占位符实例化 + 指称：{{user}}/{{char}} 已替换，统一使用「对方」
@@ -1626,7 +1656,8 @@ def selftest() -> None:
     assert spec_names == {"say", "update_state", "think", "discover_running",
                           "start_game", "read_current_text", "query_wiki",
                           "scan_game", "read_raw_text", "wiki_arbitrate",
-                          "wiki_rebuild", "query_archive", "mora_notes"}, spec_names
+                          "wiki_rebuild", "rename_game", "query_archive",
+                          "mora_notes"}, spec_names
     assert "emote" not in spec_names and "bounce" not in spec_names, \
         "emote/bounce 应为 update_state 参数"
     assert spec_names <= set(names), f"SPECS 含 schema 未注册的工具: {spec_names - set(names)}"
@@ -1655,7 +1686,7 @@ def selftest() -> None:
     finally:
         CONFIG["rmgame_enabled"] = _saved_enabled
     print("  rmgame 开关: 关闭后 schema 与提示词清单同步隐藏（单一来源过滤）✓")
-    print("  多工具 schema: rmgame 8 工具 + query_archive + mora_notes（按开关注册）✓")
+    print("  多工具 schema: rmgame 9 工具 + query_archive + mora_notes（按开关注册）✓")
 
     # 历史合并摘要：提示词含时间标注要求；fake responder 验证调用链
     merge_msgs = [
@@ -1836,6 +1867,11 @@ def selftest() -> None:
     assert "think 工具记录" in THINKING_STYLE_INSTRUCT["immersion"] \
         and "think 工具记录" in THINKING_STYLE_INSTRUCT["logical"], \
         "风格指令应指向 think 工具记录的内容"
+    # 括号旁白禁令：think 工具契约要求"不要写内心独白"，沉浸式指令不得再
+    # 要求括号包裹（曾导致模型把（心想：…）写进 think 内容，见日志 090641）
+    imm = THINKING_STYLE_INSTRUCT["immersion"]
+    assert "用括号包裹内心活动" not in imm, "沉浸式不应要求括号包裹（think 工具契约冲突）"
+    assert "不要用（心想：…）" in imm, "沉浸式应明确禁止括号包裹"
     # 解耦验证：推理相关内容不依赖 setting/llm.ini 的 reasoning（无 thinking 参数
     # 与分支；以上断言即默认配置 reasoning=false 下的行为）
     st_any = apply_state(dict(INITIAL_STATE),

@@ -22,6 +22,10 @@ from pathlib import Path
 from .discovery import RUNTIME_DIR, GameInfo
 import settings
 
+# 外部命令（PowerShell 等控制台程序）在 pythonw（无控制台）环境下默认会为
+# 每个子进程新建控制台窗口（一闪而过）；统一加 CREATE_NO_WINDOW 抑制。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # 运行配置快照（setting/app.ini，唯一配置入口；CDP/监控开关等）
 CONFIG = settings.app_config()
 
@@ -515,7 +519,7 @@ def _enum_processes(enum_fn=None) -> list:
             ["powershell", "-NoProfile", "-Command",
              "Get-CimInstance Win32_Process -Filter \"Name='Game.exe'\" | "
              "ForEach-Object { $_.ExecutablePath + '|' + $_.CommandLine + '|' + $_.ProcessId }"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
     except Exception:
         return []
     rows = []

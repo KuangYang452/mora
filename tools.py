@@ -8,7 +8,7 @@
 
 派生关系（消除手工同步点）：
 - llm._build_tools()         → schema_list()（API 注册）
-- build_system_prompt 清单   → prompt_names()（提示词只列名称）
+- build_system_prompt 清单   → ToolSpec.prompt_entry()（名称+简述+参数+返回值）
 - pet._QUERY/_GAME_TOOL_NAMES → query_names() / game_world_names()
 - 新增工具 = 在 SPECS 加一条（+ pet._tool_result 有特殊分发时加一行特判）
 
@@ -31,10 +31,25 @@ class ToolSpec:
     desc: str                                   # 语义化描述（文档/提示词辅助）
     schema: dict                                # function schema 的 parameters 体
     description: str = ""                       # function schema 的 description
+    returns: str = ""                           # 返回内容简述（提示词清单用）
     is_query: bool = False                      # 查询类（意向-动作校验）
     is_game_world: bool = False                 # 游戏世界类（<game_data> 包裹）
     rmgame: bool = False                        # RPG Maker 工具（受开关控制）
     executor: Optional[Callable] = None         # 可选执行体（args, ctx）→ 语义化文本
+
+    def prompt_entry(self) -> str:
+        """提示词清单条目：名称+简述+参数+返回值。
+
+        参数从 schema 派生（必填/可选标记），返回值为 returns 字段；
+        与 function schema 同源于本 SPECS（单一来源，避免双源不一致）。
+        """
+        req = set(self.schema.get("required") or [])
+        params = [
+            f"{pname}（{'必填' if pname in req else '可选'}）"
+            for pname in (self.schema.get("properties") or {})
+        ]
+        param_s = "、".join(params) if params else "无"
+        return f"「{self.name}」{self.desc}。参数：{param_s}。返回：{self.returns or '执行结果'}。"
 
 
 def _params(props: dict, required: list) -> dict:
@@ -60,6 +75,7 @@ SPECS: list = [
             {"text": {"type": "string",
                       "description": "你要说出的台词（1~3句、不超过60字，口语化）"}},
             ["text"]),
+        returns="—（台词经气泡展示，无返回文本）",
     ),
     ToolSpec(
         name="update_state",
@@ -88,6 +104,7 @@ SPECS: list = [
                                    "game_context 在游戏环境下自动激活，无需声明"},
             },
             ["affection_delta"]),
+        returns="更新后的状态摘要（好感度等级/内心想法/技能）",
     ),
     # ---- 推理草稿（通用推理增强通道）----
     # DeepSeek API 工具调用与思维链互斥：工具循环内没有 reasoning_content 通道，
@@ -110,6 +127,7 @@ SPECS: list = [
             {"content": {"type": "string",
                          "description": "本回合思考结论要点（≤200 字，供后续轮次引用）"}},
             ["content"]),
+        returns="—（内容已入思路链，无独立返回）",
     ),
     # ---- RPG Maker 点评工具（rmgame/bridge 执行体，开关 rmgame_enabled）----
     ToolSpec(
@@ -120,6 +138,7 @@ SPECS: list = [
             "名称/引擎/目录/入库状态（已入库 或 未入库候选）；"
             "新游戏未入库时提示确认路径（确认前不可启动）。"),
         schema=_params({}, []),
+        returns="运行中游戏列表（名称/引擎/目录/入库状态）",
     ),
     ToolSpec(
         name="start_game", rmgame=True, is_game_world=True,
@@ -131,6 +150,7 @@ SPECS: list = [
         schema=_params(
             {"game": {"type": "string", "description": "游戏库中的名称或 slug"}},
             ["game"]),
+        returns="启动结果（成功/失败原因）",
     ),
     ToolSpec(
         name="read_current_text", rmgame=True, is_query=True, is_game_world=True,
@@ -142,6 +162,7 @@ SPECS: list = [
             {"game": {"type": "string",
                       "description": "可选：游戏名称或 slug（不传则读当前快照）"}},
             []),
+        returns="文本快照（地图/场景/当前对话 + 事件摘要与原文样本）",
     ),
     ToolSpec(
         name="query_wiki", rmgame=True, is_query=True, is_game_world=True,
@@ -155,6 +176,7 @@ SPECS: list = [
              "query": {"type": "string",
                        "description": "可选：概念名或关键词；省略时返回现有概念列表"}},
             ["game"]),
+        returns="概念条目（摘要+正文）；未收录或概念列表时另有说明",
     ),
     ToolSpec(
         name="scan_game", rmgame=True, is_query=True, is_game_world=True,
@@ -166,6 +188,7 @@ SPECS: list = [
              "all": {"type": "boolean",
                      "description": "是否提取全部文本（默认 false 仅对话）"}},
             ["game"]),
+        returns="扫描结果（文本提取量/概念骨架概况）",
     ),
     ToolSpec(
         name="read_raw_text", rmgame=True, is_query=True, is_game_world=True,
@@ -183,6 +206,7 @@ SPECS: list = [
              "limit": {"type": "integer",
                        "description": "条目数上限，默认 200"}},
             ["game"]),
+        returns="条目 id 对应事件的完整上下文（按页分组）",
     ),
     ToolSpec(
         name="wiki_arbitrate", rmgame=True, is_query=True, is_game_world=True,
@@ -200,6 +224,7 @@ SPECS: list = [
              "conflict": {"type": "string",
                           "description": "可选：冲突描述（摘要说了什么、词条说了什么）"}},
             ["game", "concept"]),
+        returns="裁决结论（责任方 + 建议动作）",
     ),
     ToolSpec(
         name="wiki_rebuild", rmgame=True, is_query=True, is_game_world=True,
@@ -216,6 +241,23 @@ SPECS: list = [
                       "description": "可选：应补充进词条的 raw 条目 id 列表"
                                      "（如 ['Map013.6.39']，来自仲裁 suggested_refs）"}},
             ["game", "concept"]),
+        returns="重建结果（新条目摘要/refs 变更）",
+    ),
+    ToolSpec(
+        name="rename_game", rmgame=True,
+        desc="给游戏起名/改名（基于已读到的游戏内容给出规范名称）",
+        description=(
+            "为游戏库中的游戏起名或改名：基于已读到的游戏文本/概念"
+            "（read_current_text / query_wiki / read_raw_text 等）给出简洁、"
+            "无版本/语言标记的正式名称，作为该游戏的显示名与匹配名。"
+            "改名会自动迁移该游戏已提取的 raw / wiki / 事件摘要数据目录"
+            "（标识随新名更新），旧名保留为别名，此后的对话直接用新名称指代即可。"),
+        schema=_params(
+            {"game": {"type": "string", "description": "游戏名称或 slug"},
+             "name": {"type": "string",
+                      "description": "新的正式名称（简洁、不含版本/语言标记）"}},
+            ["game", "name"]),
+        returns="改名结果（新名称/数据目录迁移情况）",
     ),
     # ---- 归档查询（context.ContextManager 执行体）----
     ToolSpec(
@@ -237,6 +279,7 @@ SPECS: list = [
              "detail": {"type": "boolean",
                         "description": "可选：是否附上原始消息全文，默认 false（只看摘要）"}},
             []),
+        returns="归档命中记录（默认摘要；detail=true 附原文）",
     ),
     # ---- 角色私有笔记（notes.py 执行体）----
     ToolSpec(
@@ -260,6 +303,7 @@ SPECS: list = [
                          "description": "笔记文本内容（write / append 必填；"
                                         "list / read / delete 省略）"}},
             ["action"]),
+        returns="操作结果（列表/笔记内容/写入或删除确认）",
     ),
 ]
 
@@ -299,7 +343,11 @@ def game_world_names(rmgame_enabled: bool = True) -> set:
 
 
 def prompt_names(rmgame_enabled: bool = True) -> list:
-    """提示词工具清单（只列名称；say 已有专门条目不列入）。"""
+    """提示词工具名称清单（旧接口：只列名称，say 不列入）。
+
+    提示词清单现用 ToolSpec.prompt_entry()（名称+简述+参数+返回值）；
+    本函数保留供其他只取名称的用途。
+    """
     return [s.name for s in specs(rmgame_enabled) if s.name != "say"]
 
 
@@ -309,14 +357,24 @@ def selftest() -> None:
     assert len(names) == len(set(names)), "工具名重复"
     for s in SPECS:
         assert s.desc and s.description, f"{s.name} 缺描述"
+        assert s.returns, f"{s.name} 缺返回描述（提示词清单用）"
         assert isinstance(s.schema, dict) and s.schema.get("type") == "object", s.name
+    # 提示词清单条目：名称+简述+参数（必填/可选）+返回值
+    pe = by_name("read_current_text").prompt_entry()
+    assert pe.startswith("「read_current_text」") and "参数：game（可选）" in pe \
+        and "返回：" in pe, pe
+    pe2 = by_name("start_game").prompt_entry()
+    assert "参数：game（必填）" in pe2, pe2
+    pe3 = by_name("discover_running").prompt_entry()
+    assert "参数：无" in pe3, pe3
     # 派生集合与开关过滤
     on = specs(True)
     off = specs(False)
     assert all(s.rmgame for s in on if s.name in
                {"start_game", "query_wiki", "read_current_text", "scan_game",
-                "read_raw_text", "wiki_arbitrate", "wiki_rebuild", "discover_running"})
-    assert len(off) == len(on) - 8, "rmgame 关闭时应剔除 8 个工具"
+                "read_raw_text", "wiki_arbitrate", "wiki_rebuild",
+                "discover_running", "rename_game"})
+    assert len(off) == len(on) - 9, "rmgame 关闭时应剔除 9 个工具"
     assert "say" not in prompt_names(), "say 不列入提示词清单"
     assert query_names() <= game_world_names(), "查询类工具应属游戏世界类（<game_data> 包裹）"
     # think 通用推理通道：非 rmgame（开关过滤不剔除）、非查询、非游戏世界
@@ -326,7 +384,7 @@ def selftest() -> None:
         "think 既非查询类也非游戏世界类"
     th = by_name("think")
     assert th and th.schema.get("required") == ["content"], "think 应要求 content 参数"
-    print(f"  tools 注册表: {len(SPECS)} 个工具（rmgame 8 + 内建/归档/笔记/think）"
+    print(f"  tools 注册表: {len(SPECS)} 个工具（rmgame 9 + 内建/归档/笔记/think）"
           f" | 查询类 {len(query_names())} | 游戏世界类 {len(game_world_names())} ✓")
 
 
