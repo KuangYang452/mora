@@ -33,6 +33,8 @@ retry_on_vague_query = true ; 说了要查但没调查询工具 → 重试
 force_say_to_finish = true  ; 调了工具但未走 say → 重试
 retry_on_repeated_query = true ; 同一输入内二次查询（结果已可得/think 已有结论）→ 引导直接交付
 mesugaki_style_block = false ; 注入角色卡 <Mesugaki> 风格块（旧模块，默认关闭）
+content_mode = nsfw        ; 内容模式：nsfw（许可成人词汇，不得回避）/ sfw（禁止成人词汇，不允许输出）；
+                           ; 桌宠右键菜单「内容模式」可随时切换并写回本项（下回合生效）
 
 ; ---- RPG Maker 点评工具（rmgame）----
 rmgame_enabled = true       ; 点评工具开关

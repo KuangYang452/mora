@@ -36,6 +36,7 @@ CONFIG = settings.app_config()
 USER_REFERENCE = settings.user_ref()
 from llm import (
     ChatError,
+    CONTENT_MODE,
     _build_tools,
     apply_state,
     build_activation,
@@ -47,6 +48,7 @@ from llm import (
     has_query_intent,
     mid_static_sections,
     parse_llm_response,
+    set_content_mode,
     state_section,
     summarize_history,
     thinking_style_for,
@@ -538,6 +540,16 @@ class MoraPet:
         self._menu = tk.Menu(self.root, tearoff=0)
         self._menu.add_command(label="💬 聊天", command=self._open_chat)
         self._menu.add_command(label="❤️ 好感度", command=self._show_affection)
+        # 内容模式（NSFW/SFW）切换：运行时生效（下回合起），写回 app.ini
+        cur = CONTENT_MODE
+        mode_menu = tk.Menu(self._menu, tearoff=0)
+        mode_menu.add_command(
+            label="✓ 🔞 NSFW（成人内容）" if cur == "nsfw" else "🔞 NSFW（成人内容）",
+            command=lambda: self._toggle_mode("nsfw"))
+        mode_menu.add_command(
+            label="✓ 🛡️ SFW（全年龄）" if cur == "sfw" else "🛡️ SFW（全年龄）",
+            command=lambda: self._toggle_mode("sfw"))
+        self._menu.add_cascade(label="内容模式", menu=mode_menu)
         game_menu = tk.Menu(self._menu, tearoff=0)
         pending = self._load_pending_games()
         if pending:
@@ -558,6 +570,24 @@ class MoraPet:
             f"内心想法: {self.state.get('inner_thought', '')}",
         ]
         self._bubble_text("　\n".join(lines), fg="#333333", bg="#f4efe6")
+
+    def _toggle_mode(self, mode: str):
+        """切换内容模式（NSFW/SFW）：写回 app.ini 并气泡确认，下回合生效。
+
+        提示词在每回合组装时按当前 CONTENT_MODE 生成（build_system_prompt /
+        build_activation 调用时刻取值），切换后下一回合即生效，无需重启。
+        """
+        try:
+            new = set_content_mode(mode)
+        except Exception as exc:
+            self._bubble_text(f"切换内容模式失败：{exc}", fg="#c0392b", bg="#f4efe6")
+            return
+        CONFIG["content_mode"] = new
+        if new == "nsfw":
+            text = "已切换为「🔞 NSFW」内容模式：许可成人词汇，不得回避。下回合生效。"
+        else:
+            text = "已切换为「🛡️ SFW」内容模式：禁止成人词汇，不允许输出。下回合生效。"
+        self._bubble_text(text, fg="#333333", bg="#f4efe6")
 
     # ------------------------------------------------------------------ 聊天
 

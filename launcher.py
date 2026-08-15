@@ -645,6 +645,8 @@ _LLM_FIELDS = [
 _APP_FIELDS = [
     _Field("app", "tool_choice", "工具强制模式", "enum", options=["required", "auto"],
            default="required"),
+    _Field("app", "content_mode", "内容模式（NSFW/SFW）", "enum",
+           options=["nsfw", "sfw"], default="nsfw"),
     _Field("app", "agent_max_turns", "单回合自主轮数上限", "int", minv=1, maxv=32,
            default="8"),
     _Field("app", "speech_as_tool", "台词强制走 say 工具", "bool", default="true"),
