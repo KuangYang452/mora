@@ -41,6 +41,31 @@
   「正在做什么」的状态文字（按工具名映射，如查阅藏书 / 读取游戏画面 / 翻找旧
   档案），回合结束自动隐藏；占位版为简单文字，动感文字渲染后续做。
 
+### 变更
+
+- **配置运行期热读（M3 配置分层，见 docs/REFACTOR_DESIGN.md §6）**：功能开关类
+  配置（`content_mode` / `tool_choice` / `log_enabled` / `rmgame_*` / `retry_*` /
+  `mesugaki_style_block`）改为经 `settings.app_get` 运行期热读——修改
+  `setting/app.ini` 后**无需重启、下回合/下次读取即生效**；外观/行为/上下文
+  窗口等启动期配置（`scale` / `bubble_*` / `auto_chat_*` / `history_rounds` /
+  `context_keep_*` / `agent_max_turns`）语义不变（启动时读取一次）。移除
+  `llm.py` / `pet.py` / `rmgame/monitor.py` 的模块级 CONFIG 快照（pet 启动期
+  键收敛为 `self._cfg` 实例快照）；新增 `settings.app_get`（热键白名单 + mtime
+  缓存，白名单外键读取直接报错）与 `settings.override`（离线自测临时覆盖）；
+  `rmgame_enabled` 关闭时 pet 的查询/游戏世界工具名集合不再依赖开关（全量
+  集合，判定等价）。修复 `retry_on_repeated_query` / `retry_on_multi_query`
+  未入布尔类型表导致写 `false` 仍被当作真值的问题（settings.py）。
+
+- **llm.py 拆分（M1，见 docs/REFACTOR_DESIGN.md §4）**：2,187 行巨型模块按职责
+  拆为 6 个模块——`llm_prompt.py`（提示词组装：build_system_prompt + 各
+  半动态/动态段 + 激活指令/风格指令）、`llm_parse.py`（响应解析与状态结算）、
+  `llm_client.py`（HTTP 客户端）、`content_mode.py`（内容模式状态与过滤）、
+  `session.py`（进程会话快照）、`llm_card.py`（角色卡文本解析）；llm.py 瘦身
+  为编排层（call_llm / _build_tools / summarize_history）+ **兼容垫片**（旧
+  `from llm import X` 消费方零改动，v2.1 移除垫片）。**提示词产物逐字节不变**
+  （基线快照比对零 diff，缓存前缀优化不受影响）；各新模块自带 selftest，
+  llm.py 保留集成自测。重构后模块依赖方向：编排层 → 领域层 → 基座层，无环。
+
 ### 修复
 
 - **修复控制台窗口不定时闪现**：pythonw（无控制台）环境下，外部命令（PowerShell

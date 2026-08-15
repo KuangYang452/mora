@@ -15,12 +15,28 @@
 
 ```
 pet.py          桌面宠物 GUI：透明置顶、拖拽、气泡、动画、工具执行、agent 循环
-llm.py          语义化提示词组装 + OpenAI 兼容客户端 + 原生工具调用解析
-                （兼容旧文本 JSON 兜底）+ 状态结算；
-                统一 LLM 调用入口 call_llm（唯一接口，自动写调用日志）；
-                全部 LLM 调用经全局锁串行排队（同步阻塞，后续调用等待）
+llm.py          LLM 调用编排（M1 拆分后的编排层）：统一入口 call_llm（全局锁
+                串行 + 自动写调用日志 + 空响应重试）、_build_tools（工具 schema）、
+                summarize_history（历史合并）；兼容垫片再导出旧符号（消费方
+                from llm import 零改动，v2.1 移除垫片）
+llm_prompt.py   语义化提示词组装：静态 system prompt（build_system_prompt）+
+                半动态段（mid_static_sections）+ 动态尾部段（env_section /
+                tool_list_section / state_section / turn_section）+
+                激活指令（build_activation）与思维链风格指令（thinking_style_for）
+llm_parse.py    LLM 响应解析与状态结算：Reply / parse_llm_response /
+                extract_tool_calls / apply_state（硬编码规则优先，约定 6）/
+                工具结果语义化回传（tool_result_text）
+llm_client.py   OpenAI 兼容 HTTP 客户端：ChatClient / ChatError /
+                load_llm_config（tool_choice="required" 端点支持探测缓存）
+content_mode.py 内容模式（NSFW/SFW）：状态与规则（红线行/激活指令裸标记）+
+                技能白名单通用过滤（约定 8，开关不依赖技能名）
+session.py      进程会话快照：用户指称 / 当前角色 / 初始状态 / 等级映射 /
+                状态语义化叙述（_semantic_state）
+llm_card.py     角色卡文本解析：清标签 / 通道块剔除 / 开场拆解 / 占位符实例化 /
+                世界书分类（风格/好感等级/技能）/ 心理 COT 提取
 settings.py     配置加载器：setting/*.ini（app 运行配置 / llm 连接 / user 称呼）
-                + 路径中心（唯一配置入口）
+                + 路径中心（唯一配置入口）+ app_get 运行期热读（功能开关
+                修改后下回合生效、无需重启，见「配置」章节）
 character/      角色包：character/<slug>/ 一个角色一个目录
                 （card.json 角色卡 + identity.json 身份/世界观契约 + profile.ini
                 集成元数据 + sprite.png 立绘 + prototype.json 原型副本）；
@@ -179,7 +195,8 @@ profile.ini + sprite.png + prototype.json）。
    也可 `python launcher.py`；需已装 Python 3.10+，勾选 Add to PATH）；
 2. **装依赖**：启动页若提示缺少 `requests / pillow`，点「一键安装」；
 3. **填配置**：首次运行会自动跳到「配置」页，填写 LLM 的 API 地址 / Key / 模型
-   （应用、用户配置也有对应表单，保存后 app.ini 需重启桌宠生效）；
+   （应用、用户配置也有对应表单：功能开关类保存后**下回合生效**，外观/行为等
+   启动期配置保存后需重启桌宠生效）；
 4. **启动桌宠**：回到「启动」页点「🚀 启动桌宠」；
 5. **游戏入库**：在「游戏库」页选择游戏目录或 Game.exe，扫描后勾选入库即可
    （之后桌宠即可读取该游戏文本与查询 wiki）。
@@ -201,6 +218,13 @@ python pet.py                          # 直接启动桌宠（跳过控制台）
 **运行配置与 LLM 连接配置当且仅有一个生效位置：`setting/` 目录**，由
 `settings.py` 加载（唯一配置入口）。仓库只提交 `*.example` 模板；复制为正式
 文件名（`llm.ini` / `app.ini` / `user.ini`）后填写。
+
+**运行期热读（M3 配置分层）**：`app.ini` 的功能开关类配置（`content_mode` /
+`tool_choice` / `log_enabled` / `rmgame_*` / `retry_*` / `mesugaki_style_block`）
+经 `settings.app_get` 运行期热读——修改后**无需重启**、下回合/下次读取即生效；
+外观/行为/上下文窗口等**启动期配置**（`scale` / `bubble_*` / `auto_chat_*` /
+`history_rounds` / `context_keep_*` / `agent_max_turns` 等）在启动时读取一次，
+修改后需重启桌宠生效。
 
 ### LLM 连接（setting/llm.ini）
 
