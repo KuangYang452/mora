@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """事件摘要 —— rmgame/summarizer
 
 把事件完整上下文（raw 原文，可能数千字）用 LLM 压缩为结构化摘要，
@@ -14,7 +14,10 @@ import datetime as _dt
 import json
 from pathlib import Path
 
+# M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：llm 调用提升为顶层
+# （llm 为顶层模块，不反向依赖 rmgame，无环）。
 from .discovery import RUNTIME_DIR, WIKI_DIR
+from llm import call_llm
 
 SUMMARY_DIR = RUNTIME_DIR / "event_summary"
 
@@ -158,7 +161,6 @@ def _real_llm(prompt: str, entry_id: str = "") -> str:
     占满 token 预算把 content 挤没），并把 max_tokens 抬到 8192 防止截断；
     仅作用于事件摘要生成，不影响角色回合（call_llm 默认仍走配置）。
     """
-    from llm import call_llm
     resp = call_llm([{"role": "user", "content": prompt}],
                     kind="summary", max_tokens=8192,
                     note=f"{entry_id} | 生成", reasoning=False)

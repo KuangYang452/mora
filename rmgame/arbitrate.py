@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """wiki 仲裁 —— rmgame/arbitrate
 
 当剧情摘要（当前事件）与 wiki 概念条目内容冲突时，以 raw 原文为锚点
@@ -22,7 +22,13 @@ LLM 调用走 llm.call_llm（kind="wiki_arbitrate"，配置唯一来源）。
 import json
 import re as _re
 
+# M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：函数内 lazy 提升为顶层，
+# 依赖方向只向下（特性层 → 中坚/支撑层 → llm 顶层模块，无环）。
+from llm import call_llm
 from .rewriter import _collect_ref_entries, _title_refs
+from .wiki import query_concept, resolve_raw_ref
+from .llmfmt import build_event_context
+from .summarizer import load_summary
 
 # 裁决分类（LLM 输出枚举）
 VERDICTS = ("wiki_biased", "summary_biased", "narrative_shift", "both_incomplete")
@@ -37,7 +43,6 @@ _VERDICT_ZH = {
 
 def _real_llm(prompt: str, note: str = "", llm_cfg: dict = None) -> str:
     """真实 LLM 调用：统一走 llm.call_llm（配置默认唯一来源 + 自动日志）。"""
-    from llm import call_llm
     cfg = llm_cfg or {}
     resp = call_llm([{"role": "user", "content": prompt}],
                     kind="wiki_arbitrate", max_tokens=4096, note=note,
@@ -159,10 +164,6 @@ def arbitrate(slug: str, title: str, event_id: str = "",
     （如 Map005.15.44，通常取角色当前回合 match_id）；conflict：可选，
     冲突描述（自然语言）；llm_responder 供离线自测注入。
     """
-    from .wiki import query_concept
-    from .llmfmt import build_event_context
-    from .summarizer import load_summary
-
     res = query_concept(slug, title)   # 不带 builder：不触发重写
     if not res["ok"]:
         reason = {"no_wiki": "该游戏尚无 wiki", "no_concept": f"无概念「{title}」"
@@ -192,7 +193,6 @@ def arbitrate(slug: str, title: str, event_id: str = "",
         event_summary = load_summary(slug, ev_key) or ""
         if not event_summary:
             try:
-                from .wiki import resolve_raw_ref
                 r = resolve_raw_ref(f"raw://{slug}/{event_id.split('.')[0]}.json"
                                     f"#{event_id}")
                 pg = r["data"].get("page") if r["ok"] else None

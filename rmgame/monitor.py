@@ -19,7 +19,16 @@ import time
 import datetime as _dt
 from pathlib import Path
 
-from .discovery import RUNTIME_DIR, GameInfo
+from .discovery import (RUNTIME_DIR, GameInfo, auto_register, discover_dir,
+                        load_games, save_games)
+# M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：通道提供者与支撑层依赖
+# 提升为顶层（cdp/ocr 为可替换通道、matcher/summarizer/llmfmt 为纯数据/
+# 支撑层，方向只向下，无环）；winsdk 仍留在 ocr 函数内 lazy（可选依赖）。
+from .cdp import cdp_evaluate, cdp_page_url, cdp_version
+from .ocr import ocr_game_text
+from .matcher import event_key, match_text
+from .summarizer import load_summary
+from .llmfmt import is_noise_speaker
 import settings
 
 # 外部命令（PowerShell 等控制台程序）在 pythonw（无控制台）环境下默认会为
@@ -178,7 +187,6 @@ def port_for(slug: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _cdp_alive(port: int) -> bool:
-    from .cdp import cdp_version
     return cdp_version(port) is not None
 
 
@@ -294,7 +302,6 @@ def _launch_bypass(game, port: int, dry_run: bool = False):
 def _set_launch_mode(game, mode: str) -> None:
     """记忆启动方式到 games.json（auto 探测结果）。"""
     try:
-        from .discovery import load_games, save_games
         games = load_games()
         for g in games:
             if g.slug == game.slug:
@@ -335,7 +342,6 @@ def read_state(game: GameInfo, port: int = None, evaluator=None,
             if evaluator is not None:
                 raw = evaluator(_STATE_EXPR)
             else:
-                from .cdp import cdp_evaluate, cdp_page_url
                 ws_url = cdp_page_url(port)
                 raw = cdp_evaluate(ws_url, _STATE_EXPR)
             data = _parse_state(raw)
@@ -352,7 +358,6 @@ def read_state(game: GameInfo, port: int = None, evaluator=None,
             text = ""
     else:
         try:
-            from .ocr import ocr_game_text
             text = ocr_game_text(game) or ""
         except Exception:
             text = ""
@@ -395,7 +400,6 @@ def build_snapshot(game: GameInfo, port: int = None, evaluator=None,
     # 匹配 raw 精确条目 → 事件上下文/摘要（CDP 文本精确、OCR 噪声均可匹配）
     if snap["text"]:
         try:
-            from .matcher import match_text
             m = match_text(snap["text"], game.slug)
         except Exception:
             m = []
@@ -409,13 +413,11 @@ def build_snapshot(game: GameInfo, port: int = None, evaluator=None,
                 # 事件标识（Map001.40）+ 摘要缓存（若有）
                 mid = m[0].get("id", "")
                 page = m[0].get("page")
-                from .matcher import event_key as _event_key
-                ev_key = _event_key(mid, page) if mid else ""
+                ev_key = event_key(mid, page) if mid else ""
                 if ev_key:
                     snap["match_event"] = ev_key   # 含页面（Map.Ev.pN）
                     snap["match_page"] = page
                     try:
-                        from .summarizer import load_summary
                         snap["event_summary"] = load_summary(game.slug, ev_key)
                     except Exception:
                         snap["event_summary"] = None
@@ -424,7 +426,6 @@ def build_snapshot(game: GameInfo, port: int = None, evaluator=None,
 
 def _fmt_event_context(ctx: list, max_chars: int = 1500) -> str:
     """事件上下文列表 → 紧凑文本（- [id] 说话人：文本，按序，截断）。"""
-    from .llmfmt import is_noise_speaker
     lines = []
     total = 0
     for e in ctx:
@@ -569,7 +570,6 @@ def enumerate_running(enum_fn=None):
     仅返回引擎判定通过的进程（discover_dir）；端口表覆盖全部带调试端口的进程。
     enum_fn 可注入（离线自测 mock），签名 () -> [(exe, cmdline, pid)]。
     """
-    from .discovery import discover_dir
     rows = _enum_processes(enum_fn)
     ports = _parse_ports(rows)
     games, seen = [], set()
@@ -615,17 +615,14 @@ def monitor_loop_all(games, interval: float = 2.0, stop_event=None,
     prev_events = {}   # slug -> 上次事件标识（摘要生成去重）
     fail_retry = {}    # slug -> 距下次重试的剩余轮数（读取失败降频）
     auto_discover = bool(settings.app_get("rmgame_auto_discover", True))
-    from .discovery import load_games
     while (max_rounds is None or rounds < max_rounds) \
             and not (stop_event is not None and stop_event.is_set()):
         if rounds % PORT_REFRESH_ROUNDS == 0:
             running, ports = enumerate_running(enum_fn)
             if auto_discover:
-                from .discovery import auto_register as _auto_reg
-                from .discovery import load_games as _load_games
-                known = {g.slug for g in _load_games()}
+                known = {g.slug for g in load_games()}
                 for info in running:
-                    if info.slug not in known and _auto_reg(info):
+                    if info.slug not in known and auto_register(info):
                         known.add(info.slug)  # 本轮内避免重复尝试
                         if on_auto_register is not None:
                             try:

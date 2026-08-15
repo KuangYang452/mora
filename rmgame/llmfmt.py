@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """raw → LLM 友好中间格式 —— rmgame/llmfmt
 
 raw 的结构化 JSON（地图/公共事件条目）对 LLM 不友好：id/事件号/命令码
@@ -18,7 +18,10 @@ import json
 import re
 from pathlib import Path
 
+# M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：matcher 依赖提升为顶层
+# （纯数据层，向下，无环）。
 from .discovery import RAW_DIR
+from .matcher import _event_context
 
 DEFAULT_LIMIT = 200  # 单次返回条目数上限（防超长）
 
@@ -279,7 +282,6 @@ def build_event_context(slug: str, entry_id: str,
         return ""
     map_file = f"{m.group(1)}.json"
     ev_id = int(m.group(2))
-    from .matcher import _event_context
     ctx = _event_context(slug, map_file, ev_id)
     if not ctx:
         return ""
@@ -325,7 +327,6 @@ def build_event_pages(slug: str, entry_id: str,
         return ""
     map_file = f"{m.group(1)}.json"
     ev_id = int(m.group(2))
-    from .matcher import _event_context
     ctx = _event_context(slug, map_file, ev_id)
     if not ctx:
         return ""

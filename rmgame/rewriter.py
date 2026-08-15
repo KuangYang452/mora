@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """LLM 重写管线 —— rmgame/rewriter（M1：阶段 1 概念发现）
 
 职责（设计文档 §4.3）：
@@ -15,6 +15,18 @@ import re
 import datetime as _dt
 from pathlib import Path
 
+# M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：从函数内 lazy 提升为顶层——
+# rmgame 内部依赖方向唯一化（只向下，无环）。wiki↔rewriter 环已消除：
+# REJECT_NO_RELEVANT_REFS 归位 wiki（词条域），本模块单向引用。
+# llm 为顶层模块（llm 不反向依赖 rmgame，无环）。
+from .discovery import RUNTIME_DIR, WIKI_DIR
+from .wiki import (REJECT_NO_RELEVANT_REFS, load_index, resolve_raw_ref,
+                   save_index, write_index_md)
+from .summarizer import SUMMARY_DIR, load_summary
+from .llmfmt import is_noise_speaker, search_raw_entries
+from .matcher import _event_context
+from llm import call_llm
+
 # 每批地图数（摘要体量控制，见文档 §4.3 阶段 1）
 BATCH_MAPS = 30
 # 每批最多输出概念数（提示词约束）
@@ -28,10 +40,6 @@ EXTRA_REF_LIMIT = 16
 
 VALID_KINDS = {"character", "relationship", "theme", "place", "lore"}
 
-# 概念重写拒收标记：LLM 判定概念 refs 原文与概念名仅是字面/子串巧合
-# （如「出口」命中『喷出口』『说不出口』），语义上无任何片段属于该概念。
-# 返回该标记表示“无可靠原文支撑，拒收”，不落废条目（见 ensure_concept）。
-REJECT_NO_RELEVANT_REFS = "__REJECT_NO_RELEVANT_REFS__"
 # 提示词里要求 LLM 在全部片段无关时输出的单行标记（concept_rewrite 检测）。
 _REJECT_TOKEN = "<<NO_RELEVANT_REFS>>"
 
@@ -311,7 +319,6 @@ def concept_discovery(slug: str, summary: list,
 def _log_discovery_failure(slug: str, batch_no: int, raw_text: str) -> None:
     """批解析为空时把 LLM 原始响应写入 runtime/discovery_debug/（排查用）。"""
     try:
-        from .discovery import RUNTIME_DIR
         d = RUNTIME_DIR / "discovery_debug"
         d.mkdir(parents=True, exist_ok=True)
         f = d / f"{slug}_batch{batch_no}.txt"
@@ -329,7 +336,6 @@ def _real_llm(prompt: str, kind: str = "wiki_discovery", note: str = "",
     llm_cfg 仅作显式临时覆盖（model/temperature），不设兜底默认值。
     仅作用于 wiki 生成类调用，不影响角色回合（call_llm 默认仍走配置）。
     """
-    from llm import call_llm
     cfg = llm_cfg or {}
     resp = call_llm([{"role": "user", "content": prompt}],
                     kind=kind, max_tokens=8192, note=note,
@@ -348,7 +354,6 @@ def _collect_ref_entries(slug: str, refs: list) -> list:
     ref 形如 `Map001.1.0`（mapId.eventId.commandIndex）→ 由 ref 推导
     map_file，再经 raw:// 引用解析读取条目原文。
     """
-    from .wiki import resolve_raw_ref
     out = []
     for ref in refs:
         map_file = ref.split(".")[0] + ".json"
@@ -359,7 +364,6 @@ def _collect_ref_entries(slug: str, refs: list) -> list:
         ev_key = ".".join(ref.split(".")[:2]) if "." in ref else ref
         summary = None
         try:
-            from .summarizer import load_summary
             summary = load_summary(slug, ev_key) or None
             # key 兼容：摘要文件可能带页面后缀（Map005.13.p0），refs 无 page
             if not summary and e.get("page") is not None:
@@ -435,7 +439,6 @@ def _rewrite_prompt(slug: str, concept: dict, entries: list,
     lines += [
         "==== 相关原文片段 ====",
     ]
-    from .llmfmt import is_noise_speaker
     for e in entries:
         spk = (e.get("speaker") or "").strip()
         if is_noise_speaker(spk):
@@ -477,8 +480,6 @@ def _summary_refs(slug: str, terms: list, limit: int = 8) -> list:
     事件）即使原文无连续检索词，只要摘要含概念实体即可被捞到。refs
     指向条目后，_collect_ref_entries 会自动带出该事件摘要供 LLM 参考。
     """
-    from .summarizer import SUMMARY_DIR
-    from .matcher import _event_context
     d = SUMMARY_DIR / slug
     if not d.is_dir():
         return []
@@ -534,7 +535,6 @@ def _title_refs(slug: str, title: str) -> list:
     避免纯菜单标题占满名额挤掉后地图的关键对话。
     """
     import re as _re
-    from .llmfmt import search_raw_entries
 
     def _useful(text: str) -> bool:
         t = (text or "").strip()
@@ -591,8 +591,6 @@ def concept_rewrite(slug: str, concept: dict,
     # 附既有 wiki 内容（若该概念已有 built 条目）—— 供对比参考，以 RAW 为准
     old_wiki = None
     try:
-        from .discovery import WIKI_DIR
-        from .wiki import load_index
         idx = load_index(slug)
         if idx:
             c0 = next((x for x in idx.get("concepts", [])
@@ -636,8 +634,6 @@ def write_skeleton(slug: str, name: str, engine: str, concepts: list) -> dict:
     避免每次 scan_game 后全部回到 pending、下次查询全部重新 LLM 重写；
     旧文件丢失则照常回退 pending（下次查询懒构建补齐）。
     """
-    from .wiki import load_index, save_index, write_index_md
-    from .discovery import WIKI_DIR
     # 旧索引：按 title 记录已构建概念（同标题视为同一概念，id 命名变化不影响）
     old_built = {}
     old_index = load_index(slug)

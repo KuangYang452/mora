@@ -4,12 +4,17 @@
 给角色的工具通道提供执行体：5 个 rmgame 工具 → 语义化结果文本
 （供 pet.py 的 agent 循环作为 tool 消息回传给 LLM）。
 
-工具（与 data.py TOOLS / llm.py _build_rmgame_tools 对应）：
+工具（与 tools.SPECS 对应，executor 接线见 docs/REFACTOR_DESIGN.md §5）：
 - discover_running  查询当前运行中的游戏（进程枚举 + 引擎识别 + 入库状态）
 - start_game        启动游戏（注入 CDP 调试端口；仅 trust=user 可启动）
 - read_current_text 读取当前文本快照（runtime/current.json）
 - query_wiki        查询概念条目（pending 时现场 LLM 懒构建）
 - scan_game         提取文本 + 概念发现（重建 wiki 骨架）
+
+M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：本模块是门面层，函数内
+lazy import **仅为加载成本**（pet 顶层 import bridge 不拖入 monitor/rewriter/
+wiki 等整条 rmgame 链），不再承担打破循环的职责——rmgame 内部依赖方向
+已唯一化（只向下，无环）。
 
 权限约束（设计文档 §7）：
 - 只能操作游戏库（runtime/games.json）已注册的游戏；

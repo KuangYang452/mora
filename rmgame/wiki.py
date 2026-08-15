@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """wiki 目录/索引/引用管理 —— rmgame/wiki（M1）
 
 职责（设计文档 §4.3）：
@@ -7,6 +7,10 @@
 - raw:// 引用解析（需核对原文时返回 raw 对应条目/地图）
 - query_concept 定位：按概念 title/kind/地图名匹配（M1 只定位；懒构建在 M2 接）
 - 不含 LLM 逻辑（重写在 rewriter.py）
+
+M4 依赖收敛（见 docs/REFACTOR_DESIGN.md §7）：REJECT_NO_RELEVANT_REFS
+拒收标记归位本模块（词条域单一事实来源），rewriter 单向引用——
+wiki 不再反向依赖 rewriter（环消除，依赖方向只向下）。
 """
 
 import json
@@ -15,6 +19,11 @@ import datetime as _dt
 from pathlib import Path
 
 from .discovery import RAW_DIR, WIKI_DIR
+
+# 概念重写拒收标记：LLM 判定概念 refs 原文与概念名仅是字面/子串巧合
+# （如「出口」命中『喷出口』『说不出口』），语义上无任何片段属于该概念。
+# 返回该标记表示"无可靠原文支撑，拒收"，不落废条目（见 ensure_concept）。
+REJECT_NO_RELEVANT_REFS = "__REJECT_NO_RELEVANT_REFS__"
 
 # 概念状态
 STATUS_PENDING = "pending"
@@ -316,7 +325,6 @@ def ensure_concept(slug: str, concept_id: str, builder, force: bool = False) -> 
     if not force and c.get("status") == STATUS_BUILT:
         return _concept_result(c, index)   # 已构建：直接命中缓存
     content = builder(slug, c)
-    from .rewriter import REJECT_NO_RELEVANT_REFS
     if content == REJECT_NO_RELEVANT_REFS:
         # 拒收：refs 原文与概念名仅是字面/子串巧合，语义上无可靠支撑。
         # 不置 error（error 会让下次查询重复重建且可能残留误导条目），
