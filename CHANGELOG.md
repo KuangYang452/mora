@@ -77,6 +77,15 @@
   pet 的 `_TOOL_STATUS` 常量删除（状态文案单一来源 tools.SPECS）。新增工具
   流程收敛为：SPECS 一条（含 executor/status）+ 执行体，pet 零改动。
 
+- **rmgame 内部依赖收敛（M4，见 docs/REFACTOR_DESIGN.md §7）**：唯一真实环
+  `wiki ↔ rewriter` 消除——`REJECT_NO_RELEVANT_REFS` 拒收标记归位 wiki（词条域
+  单一事实来源），rewriter 单向引用；`monitor` / `rewriter` / `arbitrate` /
+  `summarizer` / `llmfmt` 的函数内 lazy import 提升为顶层，依赖方向唯一化
+  （门面层 → 特性层 → 中坚层 → 支撑层 → 运行时层 → 纯数据层，无环）；
+  lazy import 仅剩 `bridge`（加载成本：pet 顶层 import bridge 不拖入整条
+  rmgame 链）与 `cli`（自测隔离）。行为零变化（rmgame.cli selftest 全绿、
+  提示词基线零 diff、35 模块导入无环）。
+
 ### 修复
 
 - **修复控制台窗口不定时闪现**：pythonw（无控制台）环境下，外部命令（PowerShell
