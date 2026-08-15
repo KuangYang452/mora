@@ -41,7 +41,8 @@ character/      角色包：character/<slug>/ 一个角色一个目录
                 （card.json 角色卡 + identity.json 身份/世界观契约 + profile.ini
                 集成元数据 + sprite.png 立绘 + prototype.json 原型副本）；
                 load_character / current() 加载当前角色
-tools.py        工具注册表（ToolSpec 单一来源：schema / 语义化清单 / 分类标记）
+tools.py        工具注册表（ToolSpec 单一来源：schema / 语义化清单 / 分类标记 /
+                executor 执行体 / status 忙碌文案；pet 按注册表统一分发）
 textutil.py     纯文本清洗（时间前缀 / 括号旁白剥离），无任何依赖
 data.py         程序逻辑数据层：技能定义 / 游戏规则 / 好感度变化边界与 apply_delta
                 （不含角色数据、不含运行配置、不含工具清单）
@@ -336,12 +337,15 @@ python pet.py
 - **工具收尾校验**（`force_say_to_finish`，默认开）：本回合已调过工具但最终
   响应未调任何工具、直接 content 输出时，追加修复指令重试一次，强制引导回
   台词工具通道；首轮 content 直出是合法降级路径不重试。
-- **工具注册表**（`tools.py`）：新增工具只需在 `tools.SPECS` 加一条
-  `ToolSpec`（name/desc/schema/分类标记），schema、提示词清单、查询类与
-  游戏世界类名字集合全部自动派生（`_build_tools` / `prompt_names` /
-  `query_names` / `game_world_names`）；`pet._tool_result` 有特殊分发时加一行
-  特判。现有工具：`say` + `update_state` + RPG Maker 点评工具（开关
-  `CONFIG["rmgame_enabled"]`）+ `query_archive` 归档查询 + `mora_notes` 私有笔记。
+- **工具注册表**（`tools.py`，M2 接线后执行体入注册表）：新增工具只需在
+  `tools.SPECS` 加一条 `ToolSpec`（name/desc/schema/分类标记/**executor 执行体**/
+  **status 忙碌文案**），schema、提示词清单、查询类与游戏世界类名字集合全部
+  自动派生（`_build_tools` / `prompt_names` / `query_names` /
+  `game_world_names`）；`pet._tool_result` 按 `SPECS.executor` 统一分发，
+  **新增普通工具 pet 零改动**（仅内建 `say`/`update_state`/`think` 与
+  emote-bounce 兜底留在 pet）。现有工具：`say` + `update_state` + RPG Maker
+  点评工具（开关 `settings.app_get("rmgame_enabled")`）+ `query_archive`
+  归档查询 + `mora_notes` 私有笔记。
 - **RPG Maker 点评工具**（`rmgame/bridge.py` 执行体）：`discover_running` /
   `start_game` / `read_current_text` / `query_wiki` / `scan_game` /
   `read_raw_text` / `wiki_arbitrate` / `wiki_rebuild`，详见下文专章。

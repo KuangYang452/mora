@@ -66,6 +66,17 @@
   （基线快照比对零 diff，缓存前缀优化不受影响）；各新模块自带 selftest，
   llm.py 保留集成自测。重构后模块依赖方向：编排层 → 领域层 → 基座层，无环。
 
+- **工具注册表执行体接线（M2，见 docs/REFACTOR_DESIGN.md §5）**：`tools.SPECS`
+  的 `ToolSpec` 增加 `status`（忙碌状态文案，从 pet 迁移）并接续 `executor`
+  执行体（`(args, ctx) → 语义化文本`，函数内延迟 import 保持 tools 基座层
+  零顶层依赖）——rmgame 9 工具 → `rmgame.bridge.execute_tool`（闭包绑定工具名）、
+  `query_archive` → ContextManager 归档查询（ctx 注入）、`mora_notes` → notes
+  执行体；`say`/`update_state`/`think` 为内建回合通道（executor 留空）。
+  `pet._tool_result` 的 if/elif 分发改为按 `SPECS.executor` 统一分发（内建
+  特判与未知工具兜底保留，**返回文本逐字不变**——16 用例分发等价性验证）；
+  pet 的 `_TOOL_STATUS` 常量删除（状态文案单一来源 tools.SPECS）。新增工具
+  流程收敛为：SPECS 一条（含 executor/status）+ 执行体，pet 零改动。
+
 ### 修复
 
 - **修复控制台窗口不定时闪现**：pythonw（无控制台）环境下，外部命令（PowerShell
