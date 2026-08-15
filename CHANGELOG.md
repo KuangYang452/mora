@@ -20,10 +20,10 @@
   桌宠右键菜单新增「内容模式」切换（写回 app.ini，下回合生效，无需重启）；
   控制台「配置」页同步新增枚举字段；非法取值启动时报错（无静默兜底）。
   一键启动桌宠（子进程，pythonw 无控制台黑窗）；窗口/任务栏带图标
-  （`assets/launcher.ico`，`make_icon.py` 从角色立绘生成）；支持一键创建桌面
-  快捷方式（带图标）；下载即用入口 `启动莫拉.lnk`（根目录便携快捷方式，
-  `make_shortcut.py` 生成，相对路径目标随目录迁移可用）→ `start_pet.vbs` →
-  `launcher.py`，另附 `创建桌面快捷方式.bat` + `requirements.txt`。
+  （`assets/launcher.ico`，由 `make_icon.py` 从角色立绘一次性生成后随仓提交）；
+  支持一键创建桌面快捷方式（带图标，`launcher.py` 内置 `create_desktop_shortcut`）；
+  下载即用入口 `启动莫拉.lnk`（根目录便携快捷方式，相对路径目标随目录迁移
+  可用）→ `start_pet.vbs` → `launcher.py`，另附 `requirements.txt`。
 - **游戏入库工具**（控制台「游戏库」页）：选目录 / 选 Game.exe 扫描识别 →
   勾选入库（复用 rmgame/discovery）；**命名**（游戏名非规范化兜底）：入库前
   改名（slug 随名重算）、库内重命名与**角色命名工具 `rename_game`**（桌宠对话中
@@ -85,6 +85,15 @@
   lazy import 仅剩 `bridge`（加载成本：pet 顶层 import bridge 不拖入整条
   rmgame 链）与 `cli`（自测隔离）。行为零变化（rmgame.cli selftest 全绿、
   提示词基线零 diff、35 模块导入无环）。
+
+- **一致性债务清理（M5，见 docs/REFACTOR_DESIGN.md §8）**：删除 `rmgame`
+  包内死代码 `VERSION = "0.1.0"`（版本号唯一事实来源为 `settings.VERSION`，
+  违反 README「版本与发布」约定的残留）；`scan_think.py` 顶层执行逻辑收敛
+  进 `main()` + `__main__` 保护（import 不再有副作用）；修订 CHANGELOG
+  1.2 条目中与仓库不符的 `make_icon.py` / `make_shortcut.py` /
+  `创建桌面快捷方式.bat` 引用——快捷方式创建已集成 `launcher.py` 内置的
+  `create_desktop_shortcut`，图标随仓提交，删除脚本引用与现状一致。
+  `mesugaki_style_block` 旧模块保留（默认关，标注 legacy，删除列入 v2.1 候选）。
 
 ### 修复
 
