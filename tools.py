@@ -35,7 +35,9 @@ class ToolSpec:
     is_query: bool = False                      # 查询类（意向-动作校验）
     is_game_world: bool = False                 # 游戏世界类（<game_data> 包裹）
     rmgame: bool = False                        # RPG Maker 工具（受开关控制）
-    executor: Optional[Callable] = None         # 可选执行体（args, ctx）→ 语义化文本
+    executor: Optional[Callable] = None         # 执行体（args, ctx）→ 语义化文本；
+                                                # None = 内建回合通道（say/update_state/think）
+    status: str = ""                            # 忙碌状态文案（pet 头顶「她在做什么」）
 
     def prompt_entry(self) -> str:
         """提示词清单条目：名称+简述+参数+返回值。
@@ -54,6 +56,36 @@ class ToolSpec:
 
 def _params(props: dict, required: list) -> dict:
     return {"type": "object", "properties": props, "required": required}
+
+
+# ---------------------------------------------------------------------------
+# 执行体工厂（M2 接线，见 docs/REFACTOR_DESIGN.md §5）
+#
+# executor 签名：(args: dict, ctx: object) -> str。ctx 为调用方分发上下文
+# （pet 传 self.ctx——ContextManager）；rmgame / notes 执行体不依赖 ctx。
+# 统一用**函数内延迟 import**：tools 保持基座层零顶层依赖（不反向引入
+# rmgame/notes），运行时才加载执行体模块。
+# ---------------------------------------------------------------------------
+
+def _make_rmgame_executor(name: str):
+    """rmgame 工具执行体：闭包绑定工具名，转发 rmgame.bridge.execute_tool。"""
+    def _exec(args: dict, ctx) -> str:
+        from rmgame.bridge import execute_tool
+        return execute_tool(name, args)
+    return _exec
+
+
+def _mora_notes_executor(args: dict, ctx) -> str:
+    """mora_notes 执行体：转发 notes.execute（args 透传，含 action）。"""
+    from notes import execute
+    return execute(args.get("action"), args)
+
+
+def _query_archive_executor(args: dict, ctx) -> str:
+    """query_archive 执行体：需要会话上下文（ctx = ContextManager）。"""
+    return ctx.query_archive(query=args.get("query"),
+                             limit=args.get("limit", 5),
+                             detail=args.get("detail", False))
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +108,7 @@ SPECS: list = [
                       "description": "你要说出的台词（1~3句、不超过60字，口语化）"}},
             ["text"]),
         returns="—（台词经气泡展示，无返回文本）",
+        status="正在开口…",   # 内建回合通道：executor 留空（回合结束语义，不进 _tool_result）
     ),
     ToolSpec(
         name="update_state",
@@ -105,6 +138,7 @@ SPECS: list = [
             },
             ["affection_delta"]),
         returns="更新后的状态摘要（好感度等级/内心想法/技能）",
+        status="正在调整状态…",   # 内建回合通道：executor 留空（pet 内建结算）
     ),
     # ---- 推理草稿（通用推理增强通道）----
     # DeepSeek API 工具调用与思维链互斥：工具循环内没有 reasoning_content 通道，
@@ -128,6 +162,7 @@ SPECS: list = [
                          "description": "本回合思考结论要点（≤200 字，供后续轮次引用）"}},
             ["content"]),
         returns="—（内容已入思路链，无独立返回）",
+        status="正在整理思绪…",   # 内建回合通道：executor 留空（pet 内建占位）
     ),
     # ---- RPG Maker 点评工具（rmgame/bridge 执行体，开关 rmgame_enabled）----
     ToolSpec(
@@ -139,6 +174,8 @@ SPECS: list = [
             "新游戏未入库时提示确认路径（确认前不可启动）。"),
         schema=_params({}, []),
         returns="运行中游戏列表（名称/引擎/目录/入库状态）",
+        status="正在查看运行中的游戏…",
+        executor=_make_rmgame_executor("discover_running"),
     ),
     ToolSpec(
         name="start_game", rmgame=True, is_game_world=True,
@@ -151,6 +188,8 @@ SPECS: list = [
             {"game": {"type": "string", "description": "游戏库中的名称或 slug"}},
             ["game"]),
         returns="启动结果（成功/失败原因）",
+        status="正在启动游戏…",
+        executor=_make_rmgame_executor("start_game"),
     ),
     ToolSpec(
         name="read_current_text", rmgame=True, is_query=True, is_game_world=True,
@@ -163,6 +202,8 @@ SPECS: list = [
                       "description": "可选：游戏名称或 slug（不传则读当前快照）"}},
             []),
         returns="文本快照（地图/场景/当前对话 + 事件摘要与原文样本）",
+        status="正在读取游戏画面…",
+        executor=_make_rmgame_executor("read_current_text"),
     ),
     ToolSpec(
         name="query_wiki", rmgame=True, is_query=True, is_game_world=True,
@@ -177,6 +218,8 @@ SPECS: list = [
                        "description": "可选：概念名或关键词；省略时返回现有概念列表"}},
             ["game"]),
         returns="概念条目（摘要+正文）；未收录或概念列表时另有说明",
+        status="正在查阅藏书…",
+        executor=_make_rmgame_executor("query_wiki"),
     ),
     ToolSpec(
         name="scan_game", rmgame=True, is_query=True, is_game_world=True,
@@ -189,6 +232,8 @@ SPECS: list = [
                      "description": "是否提取全部文本（默认 false 仅对话）"}},
             ["game"]),
         returns="扫描结果（文本提取量/概念骨架概况）",
+        status="正在扫描游戏文本…",
+        executor=_make_rmgame_executor("scan_game"),
     ),
     ToolSpec(
         name="read_raw_text", rmgame=True, is_query=True, is_game_world=True,
@@ -207,6 +252,8 @@ SPECS: list = [
                        "description": "条目数上限，默认 200"}},
             ["game"]),
         returns="条目 id 对应事件的完整上下文（按页分组）",
+        status="正在翻看原文…",
+        executor=_make_rmgame_executor("read_raw_text"),
     ),
     ToolSpec(
         name="wiki_arbitrate", rmgame=True, is_query=True, is_game_world=True,
@@ -225,6 +272,8 @@ SPECS: list = [
                           "description": "可选：冲突描述（摘要说了什么、词条说了什么）"}},
             ["game", "concept"]),
         returns="裁决结论（责任方 + 建议动作）",
+        status="正在核对原文裁决…",
+        executor=_make_rmgame_executor("wiki_arbitrate"),
     ),
     ToolSpec(
         name="wiki_rebuild", rmgame=True, is_query=True, is_game_world=True,
@@ -242,6 +291,8 @@ SPECS: list = [
                                      "（如 ['Map013.6.39']，来自仲裁 suggested_refs）"}},
             ["game", "concept"]),
         returns="重建结果（新条目摘要/refs 变更）",
+        status="正在重建词条…",
+        executor=_make_rmgame_executor("wiki_rebuild"),
     ),
     ToolSpec(
         name="rename_game", rmgame=True,
@@ -258,6 +309,8 @@ SPECS: list = [
                       "description": "新的正式名称（简洁、不含版本/语言标记）"}},
             ["game", "name"]),
         returns="改名结果（新名称/数据目录迁移情况）",
+        status="正在为游戏起名…",
+        executor=_make_rmgame_executor("rename_game"),
     ),
     # ---- 归档查询（context.ContextManager 执行体）----
     ToolSpec(
@@ -280,6 +333,8 @@ SPECS: list = [
                         "description": "可选：是否附上原始消息全文，默认 false（只看摘要）"}},
             []),
         returns="归档命中记录（默认摘要；detail=true 附原文）",
+        status="正在翻找旧档案…",
+        executor=_query_archive_executor,   # 需要会话上下文（pet 传 self.ctx）
     ),
     # ---- 角色私有笔记（notes.py 执行体）----
     ToolSpec(
@@ -304,6 +359,8 @@ SPECS: list = [
                                         "list / read / delete 省略）"}},
             ["action"]),
         returns="操作结果（列表/笔记内容/写入或删除确认）",
+        status="正在翻看笔记…",
+        executor=_mora_notes_executor,
     ),
 ]
 
@@ -384,8 +441,25 @@ def selftest() -> None:
         "think 既非查询类也非游戏世界类"
     th = by_name("think")
     assert th and th.schema.get("required") == ["content"], "think 应要求 content 参数"
+    # M2 接线完备性：executor（内建三工具外全部非空）+ status（全部非空）
+    for s in SPECS:
+        assert s.status, f"{s.name} 缺 status（忙碌状态文案）"
+        if s.name in ("say", "update_state", "think"):
+            assert s.executor is None, f"{s.name} 为内建回合通道，不应注册 executor"
+        else:
+            assert s.executor is not None and callable(s.executor), \
+                f"{s.name} 缺 executor（M2 接线）"
+    # executor 行为抽查：query_archive 需要 ctx（ContextManager），mora_notes 不需要
+    from context import ContextManager as _CM
+    qa = by_name("query_archive").executor
+    out_qa = qa({"query": None, "limit": 5}, _CM())
+    assert out_qa == "归档为空。", out_qa
+    mn = by_name("mora_notes").executor
+    out = mn({"action": "list"}, None)
+    assert isinstance(out, str) and out, "mora_notes 执行体应返回语义化文本"
     print(f"  tools 注册表: {len(SPECS)} 个工具（rmgame 9 + 内建/归档/笔记/think）"
-          f" | 查询类 {len(query_names())} | 游戏世界类 {len(game_world_names())} ✓")
+          f" | 查询类 {len(query_names())} | 游戏世界类 {len(game_world_names())}"
+          f" | executor 接线 {sum(1 for s in SPECS if s.executor)} + 内建 3 ✓")
 
 
 if __name__ == "__main__":

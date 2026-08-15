@@ -60,7 +60,6 @@ from llm import (
 )
 from rmgame.bridge import execute_tool
 from rmgame import facade as rmgame_facade
-from notes import execute as notes_execute
 
 KEY_COLOR = "#ff00ff"  # 透明键色（Windows 的 -transparentcolor）
 BUBBLE_BG = "#fffaf2"  # 气泡底色（暖白）
@@ -68,23 +67,9 @@ BUBBLE_BORDER = "#c9d8c9"
 ERR_COLOR = "#c0392b"
 BUBBLE_MAX_W = 340      # 气泡最大像素宽
 
-# 工具调用时的忙碌状态文字（占位版；动感文字渲染后续做，见 1.2 计划）
-_TOOL_STATUS = {
-    "think": "正在整理思绪…",
-    "update_state": "正在调整状态…",
-    "discover_running": "正在查看运行中的游戏…",
-    "start_game": "正在启动游戏…",
-    "read_current_text": "正在读取游戏画面…",
-    "query_wiki": "正在查阅藏书…",
-    "scan_game": "正在扫描游戏文本…",
-    "read_raw_text": "正在翻看原文…",
-    "wiki_arbitrate": "正在核对原文裁决…",
-    "wiki_rebuild": "正在重建词条…",
-    "rename_game": "正在为游戏起名…",
-    "query_archive": "正在翻找旧档案…",
-    "mora_notes": "正在翻看笔记…",
-    "say": "正在开口…",
-}
+# 工具忙碌状态文案已入 tools.SPECS 的 status 字段（M2 接线，单一来源，
+# 见 tools.ToolSpec.status）；查询经 tools.by_name(name).status，
+# 缺省「正在忙碌…」（占位版；动感文字渲染后续做，见 1.2 计划）。
 
 # 查询类工具（意向-动作校验判定：说了要查但没调这些 → 触发重试）
 # 与游戏世界类工具（<game_data> 包裹回传）均派生自 tools.SPECS 注册表
@@ -1030,7 +1015,9 @@ class MoraPet:
                     if c["name"] in _QUERY_TOOL_NAMES or c["name"] == "query_archive":
                         self._queried_before = True   # 已实际调用过查询工具
                         self._queried_count += 1      # 本输入内查询调用计数（重复查询校验）
-                    self._set_status(_TOOL_STATUS.get(c["name"], "正在忙碌…"))
+                    _spec = tools.by_name(c["name"])
+                    self._set_status(_spec.status if _spec and _spec.status
+                                     else "正在忙碌…")
                     result = self._tool_result(c)     # 执行工具（副作用）
                     agent_msgs.append({               # tool 角色消息：协议必需配对
                         "role": "tool",
@@ -1100,8 +1087,12 @@ class MoraPet:
     def _tool_result(self, call: dict) -> str:
         """执行工具并返回结果文本（由调用方回传为 tool 角色消息）。
 
-        query_archive 走归档、mora_notes 走笔记、其余走 rmgame bridge；
-        update_state 返回语义化状态文本、think 仅占位（内容已入思路链）。
+        分发（M2 接线，见 docs/REFACTOR_DESIGN.md §5）：工具执行体在
+        tools.SPECS 的 executor 字段（单一来源）——query_archive 需要会话
+        上下文（传 self.ctx），rmgame / mora_notes 执行体不依赖 ctx；
+        update_state / think / emote-bounce 为内建回合通道（pet 内建特判，
+        executor 留空）；未知工具兜底转发 rmgame.bridge.execute_tool
+        （返回文本与历史一致）。
         工具调用信息已由 _request_llm 以单行反引号追加进累积思路链
         （如 `read_current_text:猎妻迷宫`）。返回的 result 由 _request_llm
         追加为配对 tool_call_id 的 tool 角色消息（OpenAI 兼容协议必需，
@@ -1116,7 +1107,10 @@ class MoraPet:
             args = json.loads(args_raw)
         except json.JSONDecodeError:
             args = {}
-        if name == "update_state":
+        spec = tools.by_name(name)
+        if spec is not None and spec.executor is not None:
+            result = spec.executor(args, self.ctx)   # 注册表执行体（query_archive→ctx）
+        elif name == "update_state":
             result = tool_result_text(self.state)   # 状态已由 apply_state 结算
         elif name in ("emote", "bounce"):
             # 兜底引导：旧版本 TOOLS 曾把 emote/bounce 列为独立工具，模型可能
@@ -1129,14 +1123,10 @@ class MoraPet:
             # 块），此处无副作用，仅占位（think 调用随 agent_msgs 本回合内
             # 可见，回合结束一并丢弃，不进入 ctx.history）。
             result = "think（内容已入思路链）"
-        elif name == "query_archive":
-            result = self.ctx.query_archive(query=args.get("query"),
-                                            limit=args.get("limit", 5),
-                                            detail=args.get("detail", False))
-        elif name == "mora_notes":
-            result = notes_execute(args.get("action"), args)   # 角色私有笔记
         else:
-            result = execute_tool(name, args)       # rmgame 点评工具（语义化结果）
+            # 未知工具兜底（含 say 理论不进本函数）：转发 bridge，返回文本
+            # 与历史一致（"未知工具：xxx（rmgame 支持 ...）"）。
+            result = execute_tool(name, args)
         if name in _GAME_TOOL_NAMES:
             # 游戏世界内容统一包裹：wiki 词条 / raw 原文 / 当前快照 / 仲裁与
             # 重建结果都属游戏世界，用 <game_data> 标签与角色的身份、对话空间
