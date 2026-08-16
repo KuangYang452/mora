@@ -769,7 +769,10 @@ class MoraPet:
             self._frozen_msgs = self.ctx.build_messages(
                 self.sys_prompt,
                 activation=build_activation(state_frozen, self.card),
-                first_user_instr=thinking_style_for(state_frozen),
+                # 【试验 2026-08-16】思维链风格指令已屏蔽：不再注入任何消息
+                # （msgs[0] 尾部与历史均无）——技能开/关不再改写前缀，断点
+                # 内容在稳态下完全由历史与合并决定。恢复时取消下一行注释。
+                # first_user_instr=thinking_style_for(state_frozen),
                 pre_time=pre_time,
                 mid_static=mid_static_sections(state_frozen),
                 now=loop_time,
@@ -977,6 +980,9 @@ class MoraPet:
                 # 推理是两条通道），且长值会被 _compact_call 截成残句；完整
                 # 效果经 tool 消息回传，模型可见，无需在链内重复。
                 additions = []
+                real_calls = []      # 参与协议配对的真工具：think 为内建回合
+                                     # 通道（与 say/update_state 同列），剔除
+                                     # ——不入 tool_calls、不生成 tool 消息
                 for c in calls:
                     try:
                         cargs = json.loads(c.get("arguments") or "{}")
@@ -989,6 +995,11 @@ class MoraPet:
                     elif c["name"] != "update_state":
                         additions.append(
                             f"`{_compact_call(c['name'], cargs)}`")
+                        real_calls.append(c)
+                    else:
+                        # update_state 保留配对：tool 消息携带状态结算结果与
+                        # 技能开关提醒（真实语义，非占位噪音），维持现状
+                        real_calls.append(c)
                 head = (msg.get("content") or "").strip()
                 if head and not self._think_chain:
                     additions.insert(0, head)
@@ -996,22 +1007,41 @@ class MoraPet:
                     self._think_chain = (
                         "\n".join([self._think_chain, *additions])
                         if self._think_chain else "\n".join(additions))
-                # 回传本轮：一条 assistant 累积思路链（<think> 开头、块不闭合、
-                # 含 think 文本与反引号工具调用行）+ 每条工具调用的 tool 角色
-                # 结果消息。
-                # assistant 消息保留 tool_calls 字段：协议必需配对（见下）。
+                # 回传本轮：最新一条 assistant 消息携带完整累积思路链
+                # （<think> 开头、块不闭合、含 think 文本与反引号工具调用行）；
+                # 更旧的 assistant 消息 content 置空、仅保留 tool_calls 作协议
+                # 配对占位——旧链快照是完整链的严格前缀，重复交付既浪费 token
+                # 又让"块不闭合"的协议呈现成多次重开；最终交付永远只有一条
+                # <think>。think 不入 tool_calls：它没有协议要求的 tool 回调
+                # （占位消息"内容已入思路链"是纯噪音，已随本改动移除）。
                 # ⚠️ OpenAI 兼容协议硬性要求：带 tool_calls 的 assistant 消息
                 # 之后必须紧跟每个 tool_call_id 对应的 tool 角色消息，否则 API
                 # 直接返回 400（"An assistant message with 'tool_calls' must be
                 # followed by tool messages responding to each 'tool_call_id'"）。
                 # 曾因省略 tool 消息导致多轮循环从第 2 轮起必挂（见日志 022417/
                 # 022513 的 400 报错）。
-                agent_msgs.append({
+                for m in agent_msgs:
+                    if m.get("role") == "assistant":
+                        m["content"] = ""   # 旧链快照清空：链只渲染在最新一条
+                real_tc = [tc for tc in (msg.get("tool_calls") or [])
+                           if (tc.get("function") or {}).get("name") != "think"]
+                if any(c["name"] == "think" for c in calls):
+                    _th = tools.by_name("think")
+                    self._set_status(_th.status if _th and _th.status
+                                     else "正在整理思绪…")
+                asst_msg = {
                     "role": "assistant",
                     "content": "<think>\n" + self._think_chain,
-                    "tool_calls": msg.get("tool_calls"),
-                })
-                for c in calls:
+                }
+                if real_tc:
+                    # 仅当确有真工具调用时才携带 tool_calls：DeepSeek 协议要求
+                    # tool_calls 要么缺省、要么非空数组——think-only 轮次 real_tc
+                    # 为空，传 [] 会被 400 拒绝（实测日志 220817：Invalid
+                    # 'messages[..].tool_calls': empty array）。空数组既有语义
+                    # 噪音又违规，缺省最干净。
+                    asst_msg["tool_calls"] = real_tc
+                agent_msgs.append(asst_msg)
+                for c in real_calls:
                     if c["name"] in _QUERY_TOOL_NAMES or c["name"] == "query_archive":
                         self._queried_before = True   # 已实际调用过查询工具
                         self._queried_count += 1      # 本输入内查询调用计数（重复查询校验）
@@ -1119,9 +1149,10 @@ class MoraPet:
             result = ("emote / bounce 不是独立工具：请通过 update_state 工具的 "
                       "emote / bounce 参数表达情绪与动作。")
         elif name == "think":
-            # 推理草稿通道：内容已由 _request_llm 追加进累积思路链（<think>
-            # 块），此处无副作用，仅占位（think 调用随 agent_msgs 本回合内
-            # 可见，回合结束一并丢弃，不进入 ctx.history）。
+            # 推理草稿通道：内容由 _run_agent 追加进累积思路链（<think> 块），
+            # 此处无副作用、仅占位。think 已从 real_calls 剔除（不入 tool_calls、
+            # 不生成 tool 消息，与 say/update_state 同列为内建回合通道），
+            # 本分支为防御性兜底，正常路径不会到达。
             result = "think（内容已入思路链）"
         else:
             # 未知工具兜底（含 say 理论不进本函数）：转发 bridge，返回文本
