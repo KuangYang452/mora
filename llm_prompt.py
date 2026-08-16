@@ -68,18 +68,19 @@ def activation_instruction() -> str:
             f"{USER_REFERENCE}正在玩 RPG Maker 游戏时，回答前先按随游戏环境段注入的"
             "【游戏点评规则】执行先查再答，不得凭空脑补游戏设定。\n"
         )
-    # 角色议程：贴近输出处重复一行（近因效应；正文唯一来源 = identity.json
-    # 契约字段 agenda，渲染进【你的身份与世界观】段——与内容模式裸标记同为
-    # 约定 7 的「关键规则贴近输出重复一次」，两处同源、不产生双源）。
-    # 占位符与身份段同通道实例化（_instantiate，{{user}} → USER_REFERENCE）。
-    ag = _CHAR.agenda
-    if ag:
-        text += f"你的角色议程：{_instantiate(ag)}\n"
+    # 目标：贴近输出处单独一行（近因效应；正文唯一来源 = identity.json 契约
+    # 字段 goal，只渲染进激活指令——方法论另置系统提示词【方法论】静态段，
+    # 目标不进入身份段，见 character/SCHEMA.md）。占位符与身份段同通道实例化
+    # （_instantiate，{{user}} → USER_REFERENCE）。
+    goal = _CHAR.goal
+    if goal:
+        text += f"你的目标：{_instantiate(goal)}\n"
     return text
 
 # 思维链风格指令：参照 DeepSeek-V4 角色扮演思考模式切换指南
 # （github.com/victorchen96/deepseek_v4_rolepaly_instruct）的指令块，
-# 注入到第一条 user 消息末尾（ContextManager.build_messages first_user_instr）：
+# 由 ContextManager.build_messages 组合进第一条 system 消息尾部
+# （first_user_instr——固定锚点，不随历史窗口漂移；历史消息零注入）：
 # - 激活 fetish_analysis → 思维模式要求（推理式思维链）
 # - 未激活 → 角色沉浸要求（角色扮演式思维链）
 # 文本借鉴仓库原文的精神而非照抄：前两条形式规则保留原文，第 3 条贴合本场景
@@ -119,7 +120,8 @@ THINKING_STYLE_INSTRUCT = {
 def thinking_style_for(state: dict = None) -> str:
     """按技能状态选择思维链风格指令：激活 fetish_analysis → 推理式，否则角色沉浸式。
 
-    返回的指令文本注入到第一条 user 消息末尾（build_messages 的 first_user_instr）。
+    返回的指令文本由 build_messages 组合进第一条 system 消息尾部
+    （first_user_instr；固定锚点，不随历史窗口漂移）。
     指令作用于 think 工具记录的内容（工具循环内的推理通道），与原生思考模式
     （setting/llm.ini 的 reasoning → thinking.type）无关，始终注入。
     """
@@ -492,6 +494,13 @@ def _static_parts(card: dict) -> list:
         "先调用 query_archive 检索归档，不要凭空编造或含糊带过。"
     )
 
+    # 方法论：达成目标的线索收集工作方法（identity.json 契约字段 methodology，
+    # 可选）。与目标分置投放：目标在激活指令尾部贴近输出（近因效应）、方法论
+    # 在系统提示词静态段常驻（不随回合变化，参与静态缓存前缀）——见
+    # character/SCHEMA.md；占位符由 build_system_prompt 统一实例化。
+    if _CHAR.methodology:
+        parts.append("【方法论】\n" + _CHAR.methodology)
+
     # 条件层：世界书按用途分类注入（不再无条件全量）
     style, _levels, _skills = _categorize_book(card)
     if style and settings.app_get("mesugaki_style_block", False):
@@ -591,7 +600,7 @@ def _static_parts(card: dict) -> list:
     # 由 state_section / env_section / turn_section 生成、调用方在消息序列
     # 后部注入（缓存：静态在前、动态在后）；心理 COT 由 build_activation
     # 注入激活指令（<thinking_format> 包裹），思维链风格指令由 ContextManager
-    # 注入第一条 user 消息（thinking_style_for，指向 think 工具通道）。
+    # 组合进第一条 system 消息尾部（thinking_style_for，指向 think 工具通道）。
     return parts
 
 
@@ -614,6 +623,7 @@ _PROMPT_BUDGETS = {
     "【性格】": 600,                # 莫拉无此段，预留（其他角色卡注入）
     "【情境】": 300,                # 实测 206；SCENE / 契约 scenario
     "【记忆与回忆】": 300,          # 实测 225；框架自持
+    "【方法论】": 400,              # 契约 methodology 静态注入（卡数据，见 SCHEMA.md）
     "【风格】": 900,                # mesugaki 旧模块默认关闭，预留
     "【每回合的行为方式】": 2700,   # 实测 1865；含【输出红线】+ 内容模式行；框架自持
     # —— 半动态段（mid_static_sections）——
@@ -722,7 +732,7 @@ def selftest() -> None:
     # 提示词结构：三个"情境"已合并；激活指令 + 条件注入
     for old in ("【场景】", "【当前情境】", "【你现在身处的情境】", "【对话规则】"):
         assert old not in sys_prompt, f"旧段名残留: {old}"
-    for new in ("【情境】", "【记忆与回忆】"):
+    for new in ("【情境】", "【记忆与回忆】", "【方法论】"):
         assert new in sys_prompt, f"缺少新段: {new}"
     # 好感等级规则是半动态段（mid_static_sections，跨级才变），不进入静态段
     assert "【好感等级规则】" not in sys_prompt, \
@@ -1023,12 +1033,17 @@ def selftest() -> None:
     act_default = build_activation(st0, card)
     assert act_default.startswith("内容模式:NSFW\n"), act_default
     assert act_default.count("内容模式:NSFW") == 1, act_default
-    # 角色议程：契约字段渲染进身份段 + 激活指令尾部贴近输出重复（同源，见约定 7）
-    if session._CHAR.agenda:
-        assert "角色议程：" in sys_prompt, \
-            "角色议程应渲染进【你的身份与世界观】段（identity.json 契约 agenda）"
-        assert "你的角色议程：" in act_default, \
-            "角色议程应在激活指令尾部贴近输出重复（近因效应）"
+    # 目标/方法论分置投放：目标 → 激活指令尾部贴近输出（你的目标：…，近因
+    # 效应，契约 goal）；方法论 → 系统提示词【方法论】静态段（契约 methodology）；
+    # 两者互不进入对方位置（见 character/SCHEMA.md）
+    if session._CHAR.goal:
+        assert "你的目标：" in act_default, \
+            "目标应在激活指令尾部贴近输出（identity.json 契约 goal，近因效应）"
+        assert "你的目标：" not in sys_prompt, "目标不应渲染进系统提示词（只贴近输出）"
+    if session._CHAR.methodology:
+        assert "【方法论】" in sys_prompt, \
+            "方法论应渲染进系统提示词【方法论】段（identity.json 契约 methodology）"
+        assert "【方法论】" not in act_default, "方法论不应渲染进激活指令"
     _saved_mode = content_mode.CONTENT_MODE
     try:
         content_mode.CONTENT_MODE = "sfw"

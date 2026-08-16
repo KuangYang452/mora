@@ -207,17 +207,19 @@ class CharacterData:
                 and not (isinstance(sc.get("default"), str) and sc["default"].strip()):
             warnings.append("identity.scenario.default 应为非空字符串，已忽略")
             sc["default"] = ""
-        # agenda：可选，字符串或非空字符串数组（角色议程，见 SCHEMA.md）
-        if "agenda" in data and data["agenda"] is not None:
-            v = data["agenda"]
-            ok = (isinstance(v, str) and v.strip()) or (
-                isinstance(v, list) and v
-                and all(isinstance(x, str) and x.strip() for x in v))
-            if not ok:
-                warnings.append(
-                    f"identity.agenda 应为字符串或字符串数组，实际 "
-                    f"{type(v).__name__}，已忽略")
-                data["agenda"] = ""
+        # goal / methodology：可选，字符串或非空字符串数组（目标 → 激活指令
+        # 尾部；方法论 → 系统提示词【方法论】段，见 SCHEMA.md）
+        for _key in ("goal", "methodology"):
+            if _key in data and data[_key] is not None:
+                v = data[_key]
+                ok = (isinstance(v, str) and v.strip()) or (
+                    isinstance(v, list) and v
+                    and all(isinstance(x, str) and x.strip() for x in v))
+                if not ok:
+                    warnings.append(
+                        f"identity.{_key} 应为字符串或字符串数组，实际 "
+                        f"{type(v).__name__}，已忽略")
+                    data[_key] = ""
         return data, warnings
 
     def _load_profile(self) -> dict:
@@ -317,21 +319,34 @@ class CharacterData:
         """降级台词模板（未实例化；调用方自行 instantiate）。"""
         return self.profile.get("fallback", {}).get(key, "")
 
-    @property
-    def agenda(self) -> str:
-        """角色议程（identity.json 契约可选字段；字符串或字符串数组 → 单段文本）。
-
-        渲染进【你的身份与世界观】段（角色议程：…），并在激活指令尾部
-        贴近输出重复一行（近因效应，见 llm_prompt.activation_instruction；
-        两处同源，不产生双源）。
-        """
-        v = (self.identity_data or {}).get("agenda")
+    @staticmethod
+    def _text_field(data: dict, key: str) -> str:
+        """契约可选字符串字段：字符串或字符串数组 → 单段文本（数组按行渲染）。"""
+        v = (data or {}).get(key)
         if isinstance(v, str):
             return v.strip()
         if isinstance(v, list):
             return "\n".join(x.strip() for x in v
                              if isinstance(x, str) and x.strip())
         return ""
+
+    @property
+    def goal(self) -> str:
+        """角色目标（identity.json 契约可选字段；字符串或字符串数组 → 单段文本）。
+
+        渲染进激活指令尾部（你的目标：…，贴近输出、近因效应），**不进**
+        【你的身份与世界观】段——目标只贴近输出出现一次，见 SCHEMA.md。
+        """
+        return self._text_field(self.identity_data, "goal")
+
+    @property
+    def methodology(self) -> str:
+        """方法论（identity.json 契约可选字段；字符串或字符串数组 → 单段文本）。
+
+        渲染进系统提示词【方法论】静态段（达成目标的工作方法），与目标分置
+        两处：目标在激活指令（近因效应）、方法论在系统提示词，见 SCHEMA.md。
+        """
+        return self._text_field(self.identity_data, "methodology")
 
     def render_identity(self) -> str:
         """渲染【你的身份与世界观】段（契约模板，见 character/SCHEMA.md）。
@@ -394,10 +409,8 @@ class CharacterData:
                 if items:
                     lines.append(label + "：" + "\n".join(items))
 
-        # 角色议程：长期动机/目标（契约可选字段；放在背景之后、社会关系之前，
-        # 让「为什么做这些事」紧跟「正在做什么」）
-        if self.agenda:
-            lines.append("角色议程：" + self.agenda)
+        # 目标 / 方法论不渲染进身份段：目标 → 激活指令尾部（你的目标：…，
+        # 近因效应）、方法论 → 系统提示词【方法论】静态段（见 SCHEMA.md）
 
         for label, key in (("社会关系", "relationships"), ("能力", "abilities"),
                            ("特质", "traits"), ("对话风格", "dialogue_style")):
@@ -534,9 +547,14 @@ def selftest() -> None:
     rid = c.render_identity()
     assert c.display_name in rid and "{{user}}" in rid, \
         "渲染应含显示名与 {{user}} 占位符（组装时统一实例化）"
-    # 角色议程（可选契约字段）：有则渲染「角色议程：…」块、无则不渲染
-    assert ("角色议程：" in rid) == bool(c.agenda), \
-        "角色议程应随契约字段存在与否渲染"
+    # 目标 / 方法论（可选契约字段）：字符串或字符串数组均可解析；身份段不再
+    # 渲染议程——目标 → 激活指令尾部、方法论 → 系统提示词【方法论】段
+    # （见 llm_prompt.selftest）
+    assert "角色议程：" not in rid, "身份段不应再渲染角色议程"
+    assert isinstance(c.goal, str) and isinstance(c.methodology, str), \
+        (c.goal, c.methodology)
+    assert "目标：" not in rid and "方法论：" not in rid, \
+        "目标/方法论不应渲染进身份段（分置激活指令 / 系统提示词【方法论】段）"
     # scenario / opening 契约（v2）：默认场景非空、开场台词流非空
     assert c.scenario_default, "scenario.default 必填（v2 契约）"
     assert c.opening and all(isinstance(x, str) and x.strip() for x in c.opening), c.opening
