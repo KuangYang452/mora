@@ -261,11 +261,19 @@ class ContextManager:
         落在历史之后，使静态 system 段、mid_static 段与历史段成为稳定缓存
         前缀。元素为字符串（自动包成 system 消息）或完整消息 dict。
 
-        first_user_instr：思维链风格指令，追加到第一条 user 历史消息末尾
-        （紧贴用户首句，靠近模型生成位置）；若历史中还没有 user 消息
-        （纯开场白回合），则作为独立【思维链风格】system 消息注入。
+        first_user_instr：思维链风格指令（thinking_style_for 输出），组合进
+        第一条 system 消息（静态 system prompt）**尾部**——固定锚点、不随历史
+        窗口漂移：历史 user 消息的字节完全由历史自身决定（除绝对时间标注外
+        零注入），合并/裁剪不会让指令改挂到别的消息上；指令随技能状态切换时
+        只改 system prompt 尾部，不再改写任何历史消息（历史段因此真正成为
+        稳定缓存前缀）。
         """
         msgs = [{"role": "system", "content": system_prompt}]
+        # 思维链风格指令：组合进第一条 system 消息尾部（固定锚点，见
+        # first_user_instr 参数说明）。指令文本自带【角色沉浸要求】/【思维
+        # 模式要求】标题，作为 system prompt 的收尾段；不新增消息条数。
+        if first_user_instr:
+            msgs[0]["content"] += "\n\n" + first_user_instr
         # mid_static 半动态段：静态之后、中期记忆之前（变化频率：等级规则
         # 跨级才变 / 技能 world book 激活才变，均低于合并条目）。
         for seg in mid_static or []:
@@ -293,28 +301,17 @@ class ContextManager:
         # 保持纯台词：若带前缀，模型会把「assistant 消息 = 时间标注 + 台词」
         # 当成自己的发言格式模仿进输出（旧全角括号样式曾导致（刚刚）污染）。
         trimmed = self.trimmed
-        first_user_idx = next((i for i, m in enumerate(trimmed)
-                               if m.get("role") == "user"), None)
         for i, m in enumerate(trimmed):
             label = abs_time_label(m.get("time"))
             content = m.get("content", "")
             if label and m.get("role") == "user":
                 content = f"{label} {content}"
-            if first_user_instr and i == first_user_idx:
-                content = f"{content}\n\n{first_user_instr}"
             if m.get("role") == "assistant":
                 # 临时措施：历史旧风格台词带括号旁白（（歪头凑近）等），
                 # 展示层统一清洗为纯台词，避免模型把「括号旁白 + 台词」当成
                 # 自己的发言格式模仿进输出；存储与归档保留原文可回溯。
                 content = strip_paren_annotations(content)
             msgs.append({"role": m.get("role", "user"), "content": content})
-        # 思维链风格指令：历史中没有 user 消息（纯开场白回合）时，作为
-        # 独立【思维链风格】system 消息注入。
-        if first_user_instr and first_user_idx is None:
-            msgs.append({
-                "role": "system",
-                "content": "【思维链风格】\n" + first_user_instr,
-            })
         # 动态尾部段（pre_time）：状态/环境/推进等高频变化内容，插在时间
         # 锚点之前——全部位于历史之后，system 静态段与历史段不受其影响，
         # 可连续命中缓存前缀（静态在前、动态在后）。
@@ -416,13 +413,17 @@ def selftest() -> None:
     assert msgs2[-1]["role"] == "system" and msgs2[-1]["content"].endswith("ACT_NOW"), msgs2
     assert msgs2[-1]["content"].startswith("【本回合指令】"), msgs2[-1]
     assert len(msgs2) == len(msgs) + 1, msgs2
-    # first_user_instr：追加到第一条 user 历史消息末尾（紧贴用户首句）
+    # first_user_instr：组合进第一条 system 消息尾部（固定锚点；历史 user
+    # 消息不再被注入——字节完全由历史自身决定，与无指令时逐字节一致）
     msgs3i = ctx.build_messages("SYS", first_user_instr="【思维模式要求】推理式")
     assert len(msgs3i) == len(msgs), "first_user_instr 不应改变消息条数"
+    assert msgs3i[0]["content"].startswith("SYS"), "指令应附加在 system prompt 尾部"
+    assert msgs3i[0]["content"].endswith("【思维模式要求】推理式"), msgs3i[0]
     fu = msgs3i[1]  # 第一条 user 历史（你好）
-    assert fu["role"] == "user" and fu["content"].endswith("【思维模式要求】推理式"), fu
+    assert fu["role"] == "user" and fu["content"] == msgs[1]["content"], \
+        "历史 user 消息不应被改写（与无指令时逐字节一致）"
     assert fu["content"].startswith("["), "首句仍应带绝对时间前缀"
-    # 后续 user 消息不重复注入；assistant 历史保持纯台词
+    # 后续 user 消息不注入；assistant 历史保持纯台词
     assert "【思维模式要求】推理式" not in msgs3i[3]["content"], msgs3i[3]
     assert msgs3i[2]["content"] == "哼哼～", msgs3i[2]
     assert msgs3i[4]["content"] == "好的～", msgs3i[4]
@@ -442,12 +443,14 @@ def selftest() -> None:
     # pre_time 支持 None（不改变结构）
     msgs_pt2 = ctx.build_messages("SYS", pre_time=None)
     assert len(msgs_pt2) == len(msgs), "pre_time=None 不应改变结构"
-    # 纯开场白（无 user 历史）：风格指令作为独立【思维链风格】system 消息
+    # 纯开场白（无 user 历史）：风格指令同样组合进第一条 system 消息尾部
+    # （不再有独立【思维链风格】system 消息——固定锚点唯一、无形态切换）
     ctx_open = ContextManager(rounds=2, opening=["开场A", "开场B"])
     msgs_open = ctx_open.build_messages("SYS", first_user_instr="【角色沉浸要求】沉浸式")
-    style_msgs = [m for m in msgs_open if "【思维链风格】" in m["content"]]
-    assert len(style_msgs) == 1 and style_msgs[0]["role"] == "system", msgs_open
-    assert style_msgs[0]["content"].startswith("【思维链风格】"), style_msgs[0]
+    assert msgs_open[0]["content"].endswith("【角色沉浸要求】沉浸式"), msgs_open[0]
+    assert not any("【思维链风格】" in m["content"] for m in msgs_open), \
+        "独立【思维链风格】system 消息应已移除（指令只进第一条 system 尾部）"
+    assert msgs_open[1]["content"] == "开场A", "开场白历史保持原样"
 
     # mid_static 半动态段：静态 system 之后、中期记忆之前
     msgs_mid = ctx.build_messages("SYS", mid_static=["段M1", "段M2"])
