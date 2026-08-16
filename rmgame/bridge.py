@@ -24,6 +24,10 @@ wiki 等整条 rmgame 链），不再承担打破循环的职责——rmgame 内
 - LLM 调用（懒构建/概念发现）复用 setting/llm.ini（唯一配置来源）
 """
 
+# 叙述层指称：工具结果回传统一使用 USER_REFERENCE（setting/user.ini 的 ref，
+# 启动期冻结；缺省「对方」，见 session.py）
+from session import USER_REFERENCE
+
 
 def _resolve_game(args: dict):
     """从工具参数解析游戏；返回 (GameInfo, None) 或 (None, 错误文本)。
@@ -85,7 +89,7 @@ def _discover_running(args: dict) -> str:
         if names:
             tail = (f"游戏库中已有 {len(names)} 个游戏可启动："
                     + "、".join(names)
-                    + "。若对方请求启动游戏，直接调用 start_game"
+                    + f"。若{USER_REFERENCE}请求启动游戏，直接调用 start_game"
                     "（参数 game 用上述名称或 slug）。")
         return ("当前未检测到运行中的 RPG Maker 游戏"
                 "（进程名 Game.exe + 引擎特征判定）。" + tail)
@@ -165,7 +169,7 @@ def _fmt_snapshot(cur: dict) -> str:
     else:
         parts.append("当前文本：（无）——画面无文字（可能处于加载/过场/菜单间隙），"
                      "重复查询通常不会变化，勿在短时间内反复查询同一状态；"
-                     "可直接点评当前状态或询问对方，或等场景变化后再查。")
+                     f"可直接点评当前状态或询问{USER_REFERENCE}，或等场景变化后再查。")
     # 当前事件摘要：LLM 提炼的全文概述（精炼内容，完整展示），含当前位置
     # 之前与之后的内容（可能剧透）；仅经本工具提供（不进游戏环境段）
     es = (cur.get("event_summary") or "").strip()
@@ -333,7 +337,7 @@ def _auto_register_concept(g, q: str, builder) -> str:
     refs = _concept_refs(g.slug, q)
     if not refs:
         return (f"未找到与「{q}」相关的概念（raw 与事件摘要均无可引用素材；"
-                "不得自行补充该概念的设定细节——如实告知对方尚未收录；"
+                f"不得自行补充该概念的设定细节——如实告知{USER_REFERENCE}尚未收录；"
                 "若需收录可调用 scan_game 补充资料）。")
     # 防分裂：refs 重叠且判为同义 → 并入别名，复用既有条目；
     # 判为仅相关 → 注册独立概念，并把重叠概念记为关联

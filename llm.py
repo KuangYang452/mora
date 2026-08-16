@@ -160,14 +160,14 @@ def summarize_history(msgs: list, old_merge: dict = None,
     lines = []
     for m in msgs:
         label = abs_time_label(m.get("time"))
-        who = "角色" if m.get("role") == "assistant" else "对方"
+        who = "角色" if m.get("role") == "assistant" else session.USER_REFERENCE
         head = f"{label} {who}：" if label else f"{who}："
         lines.append(head + m.get("content", ""))
     prompt = (
         "你是对话摘要助手。下面是一段较早的角色（当前桌宠）"
-        "与对方的对话历史，已被移出当前上下文。\n"
+        f"与{session.USER_REFERENCE}的对话历史，已被移出当前上下文。\n"
         "请压缩为结构化摘要（纯重写，不照抄原文台词）：\n"
-        "- 剧情/话题进展、重要信息、对方与角色关系的变化（好感相关事件）；\n"
+        f"- 剧情/话题进展、重要信息、{session.USER_REFERENCE}与角色关系的变化（好感相关事件）；\n"
         "- 保留关键称呼与话语要点；\n"
         "- 输出 200~400 字。\n"
         "- 只输出摘要正文：不要标注时间段（时间窗由程序按被合并消息的"
@@ -208,8 +208,9 @@ from llm_card import (  # noqa: E402,F401  （迁移目标：llm_card）
     _strip_status_block, extract_opening)
 from llm_prompt import (  # noqa: E402,F401  （迁移目标：llm_prompt）
     THINKING_STYLE_INSTRUCT, activation_instruction, build_activation,
-    build_system_prompt, env_section, mid_static_sections, state_section,
-    thinking_style_for, tool_list_section, turn_section)
+    build_system_prompt, env_section, framework_static_budget,
+    mid_static_sections, prompt_budget, state_section, thinking_style_for,
+    tool_list_section, turn_section)
 from llm_parse import (  # noqa: E402,F401  （迁移目标：llm_parse）
     Reply, apply_state, extract_tool_calls, has_query_intent, parse_llm_reply,
     parse_llm_response, tool_result_text)
@@ -287,7 +288,7 @@ def _selftest_orchestration() -> None:
             "rmgame 关闭后工具清单不应含 rmgame 工具"
         assert "query_archive" in tl_off and "mora_notes" in tl_off, "常开工具应保留"
         assert "可调用 read_current_text" not in sp_off, "开关关闭后不应提示调用 rmgame 工具"
-        assert "【对方正在…】" not in sp_off
+        assert f"【{session.USER_REFERENCE}正在…】" not in sp_off
         assert "game_context" not in sp_off, "开关关闭后技能清单不应含 game_context"
         act_off = llm_prompt.activation_instruction()
         assert "先查再答" not in act_off, "开关关闭后激活指令不应含 GAME_RULES"

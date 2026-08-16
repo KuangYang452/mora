@@ -20,6 +20,10 @@ context / notes.py（say、update_state 为内建，query_archive 需会话上�
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+# 叙述层指称：进提示词/API schema 的描述统一使用 USER_REFERENCE
+#（setting/user.ini 的 ref，启动期冻结；缺省「对方」，见 session.py）
+from session import USER_REFERENCE
+
 # ---------------------------------------------------------------------------
 # ToolSpec
 # ---------------------------------------------------------------------------
@@ -129,7 +133,7 @@ SPECS: list = [
                     "type": "string",
                     "enum": ["none", "害羞", "得意", "生气", "愉悦", "戏谑", "撒娇"],
                     "description": "情绪表情（气泡前会显示对应符号）"},
-                "bounce": {"type": "boolean", "description": "是否跳一下吸引对方注意"},
+                "bounce": {"type": "boolean", "description": f"是否跳一下吸引{USER_REFERENCE}注意"},
                 "skills": {
                     "type": "array", "items": {"type": "string"},
                     "description": "要激活的技能名列表（空数组 = 全部关闭）；"
@@ -209,7 +213,7 @@ SPECS: list = [
         name="query_wiki", rmgame=True, is_query=True, is_game_world=True,
         desc="查询游戏的 wiki 概念条目（未构建的现场生成）",
         description=(
-            "回答对方关于游戏角色、剧情、设定或地点的问题前，必须先调用本工具查询该游戏的 wiki 概念条目"
+            f"回答{USER_REFERENCE}关于游戏角色、剧情、设定或地点的问题前，必须先调用本工具查询该游戏的 wiki 概念条目"
             "（角色/主题/地点/设定）；未构建的概念会现场生成；query 省略时返回概念列表。"
             "查询无结果时如实告知，不得自行编造设定。"),
         schema=_params(
@@ -315,9 +319,9 @@ SPECS: list = [
     # ---- 归档查询（context.ContextManager 执行体）----
     ToolSpec(
         name="query_archive",
-        desc="查询角色与对方历史对话的归档（较早对话被压缩合并后归档于此）",
+        desc=f"查询角色与{USER_REFERENCE}历史对话的归档（较早对话被压缩合并后归档于此）",
         description=(
-            "查询角色与对方历史对话的归档（较早对话被压缩合并后归档于此）；"
+            f"查询角色与{USER_REFERENCE}历史对话的归档（较早对话被压缩合并后归档于此）；"
             "需要回忆更早对话的细节（角色/话题/说过的话）时调用。"
             "默认只返回各归档的摘要（已足够回忆大概）；确需核对逐字台词时"
             "设 detail=true 取原文（原文较长，请配合较小的 limit）。"

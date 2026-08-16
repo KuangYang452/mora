@@ -22,7 +22,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from data import AFFECTION_MAX_DELTA
-from llm import build_system_prompt, get_character, load_llm_config
+from llm import (build_system_prompt, framework_static_budget, get_character,
+                 load_llm_config, prompt_budget)
 import logutil
 import settings
 import character as character_mod
@@ -30,7 +31,8 @@ import character as character_mod
 
 def print_prompt() -> None:
     card = get_character()          # 当前激活角色卡（character/<slug>/card.json）
-    prompt = build_system_prompt(card, state=character_mod.current().initial_state())
+    state = character_mod.current().initial_state()
+    prompt = build_system_prompt(card, state=state)
     print("=" * 60)
     print(f"最终交付给 LLM 的 system prompt（长度 {len(prompt)} 字符）")
     print("=" * 60)
@@ -43,6 +45,18 @@ def print_prompt() -> None:
     print("\n" + "=" * 60)
     print(f"总计 {len(prompt)} 字符 | 人设来源: character/{character_mod.current().slug}/"
           f"（card.json + profile.ini） | 状态来源: 角色初始状态（profile [state]）")
+
+    # 篇幅预算表（工程级约定 7 机器可执行形态，见 llm_prompt.prompt_budget）：
+    # 逐段 字符/预算/余量，超限行提示——开发迭代期回潮防护的观测点。
+    print("\n提示词篇幅预算（字符；预算 = 重构后基线 ×1.3，超限即压缩或带理由改预算）：")
+    rows = prompt_budget(state, card)
+    for r in rows:
+        budget = r["budget"] if r["budget"] is not None else "未登记"
+        mark = "  ← 超预算" if r["over"] else ""
+        print(f"  {r['section']:<14} {r['chars']:>5} / {str(budget):>5}{mark}")
+    fw_chars = sum(r["chars"] for r in rows
+                   if r["section"] in ("【记忆与回忆】", "【每回合的行为方式】"))
+    print(f"  {'框架静态合计':<14} {fw_chars:>5} / {framework_static_budget():>5}")
     print("=" * 60)
 
 

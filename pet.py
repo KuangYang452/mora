@@ -95,12 +95,12 @@ def idle_activation_prompt(env: dict or None) -> str:
     """
     gname = (env or {}).get("game_name") or (env or {}).get("game") or ""
     if gname:
-        return (f"（现在没有人在跟你说话，但对方正在玩《{gname}》。"
-                "你可以结合当前游戏画面与进度说一句贴合场景的话——"
-                "点评、调侃或关心对方的游戏表现都行，让对方注意到你；"
+        return (f"（现在没有人在跟你说话，但{USER_REFERENCE}正在玩《{gname}》。"
+                f"你可以结合当前游戏画面与进度说一句贴合场景的话——"
+                f"点评、调侃或关心{USER_REFERENCE}的游戏表现都行，让{USER_REFERENCE}注意到你；"
                 "通过 say 工具说出台词。）")
-    return ("（现在没有人在跟你说话，你可以随意说一句问候、"
-            "撒娇或戏弄对方的话，让对方注意到你；"
+    return (f"（现在没有人在跟你说话，你可以随意说一句问候、"
+            f"撒娇或戏弄{USER_REFERENCE}的话，让{USER_REFERENCE}注意到你；"
             "通过 say 工具说出台词。）")
 
 
@@ -277,7 +277,7 @@ class MoraPet:
         """按配置拉起 rmgame 监控守护线程（多游戏轮询写 current.json）。
 
         桌宠常驻期间持续跟踪已注册游戏的运行状态（CDP → OCR 兜底），
-        让【对方正在…】环境段与 read_current_text 始终有数据可用。
+        让【{USER_REFERENCE}正在…】环境段与 read_current_text 始终有数据可用。
         守护线程异常不影响桌宠本体。
 
         空库也必须拉起：自动发现（rmgame_auto_discover）正是为「运行中的
@@ -1551,9 +1551,17 @@ class MoraPet:
     # ------------------------------------------------------------------ 退出
 
     def _quit(self):
+        # 关闭桌宠 = 对方离开：重置必要内容（回合级临时状态，如已激活技能——
+        # 技能由 LLM 声明、跨回合持久，离开后不应残留到下次会话），
+        # 并在上下文追加一行用户消息「*{用户称呼}离开了*」（{{user}} 实例化为
+        # setting/user.ini 的 ref），下次启动时角色能感知对方离开过
+        #（恢复存档后 _greet 会追加「*{用户称呼}看向了你*」衔接重聚）。
+        self.state["skills"] = []
+        self.ctx.add_user(f"*{USER_REFERENCE}离开了*")
         # 停止 rmgame 监控守护线程（daemon 也会随进程退出，这里显式停止更干净）
         self._monitor_stop.set()
-        # 状态与对话历史落盘（回合结束已保存，退出时再兜底一次）
+        # 状态与对话历史落盘（含重置后的技能与"离开"消息；回合结束已保存，
+        # 退出时再兜底一次）
         persist.save_session(self.state, self.ctx.history,
                              self.ctx.merge, self.ctx.archives)
         self.root.destroy()

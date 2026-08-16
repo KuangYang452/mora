@@ -85,7 +85,7 @@ working = （{{char_self}}还在忙…下次再来听结果吧）
 template = {{user}}走向了{{char_name}}
 
 [prompt]
-persona = 你保持自己的性格与说话风格，自然地与对方交流；对方是与你平等聊天的普通人。
+persona = 你保持自己的性格与说话风格，自然地与{{user}}交流；{{user}}是与你平等聊天的普通人。
 immersion_perspective = 以{{identity}}的视角观察{{user}}
 """
 

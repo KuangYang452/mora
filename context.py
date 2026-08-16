@@ -21,6 +21,7 @@ docstring 只记模块内机制，不重复约定全文）。
 
 from datetime import datetime
 
+from session import USER_REFERENCE
 from textutil import strip_paren_annotations
 
 _WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"]
@@ -254,7 +255,7 @@ class ContextManager:
         历史消息用绝对时间标注（abs_time_label，逐字节稳定）而非相对时间
         （相对标注会随请求时刻漂移、切断历史段缓存前缀）。
 
-        pre_time：高频变化的动态段（如【对方正在…】/【本回合可用工具】/
+        pre_time：高频变化的动态段（如【{USER_REFERENCE}正在…】/【本回合可用工具】/
         【当前状态】/【本回合推进】，见 llm.env_section / tool_list_section /
         state_section / turn_section），按给定顺序插在时间锚点之前——全部
         落在历史之后，使静态 system 段、mid_static 段与历史段成为稳定缓存
@@ -274,7 +275,7 @@ class ContextManager:
                 msgs.append({"role": "system", "content": str(seg)})
         # 合并条目：更早历史的压缩（中期记忆层）
         # 措辞双重要求：明确「这是你的中期记忆」，同时保留防御语义——
-        # 它是对更早对话的压缩，不是对方刚说的话，不要当作本回合发言来回应。
+        # 它是对更早对话的压缩，不是{USER_REFERENCE}刚说的话，不要当作本回合发言来回应。
         # 时间窗由程序按被合并消息的绝对时间换算（_merge_time_span，绝对
         # 格式、逐字节稳定），不依赖 LLM 摘要中可能过时的相对时间。
         if self.merge and (self.merge.get("summary") or "").strip():
@@ -283,7 +284,7 @@ class ContextManager:
                 "role": "system",
                 "content": "【中期记忆】以下是你对更早对话的压缩记忆，属于你的"
                            "中期记忆层（更早但不遥远的过往）；它是你记忆的浓缩，"
-                           "不是对方刚说的话，也不要求你现在回应，仅供回忆参考。\n"
+                           f"不是{USER_REFERENCE}刚说的话，也不要求你现在回应，仅供回忆参考。\n"
                            + (span + "\n" if span else "")
                            + self.merge["summary"].strip(),
             })
@@ -504,7 +505,7 @@ def selftest() -> None:
     msgs3 = ctx2.build_messages("SYS")
     assert msgs3[1]["role"] == "system" and "中期记忆" in msgs3[1]["content"], msgs3[1]
     assert "新合并摘要" in msgs3[1]["content"]
-    assert "不是对方刚说的话" in msgs3[1]["content"], "应保留防误用语义"
+    assert f"不是{USER_REFERENCE}刚说的话" in msgs3[1]["content"], "应保留防误用语义"
     assert "更早的历史合并" not in msgs3[1]["content"], "旧标注应替换"
     assert "非对话内容" not in msgs3[1]["content"], "旧标注应替换"
     assert msgs3[-1]["role"] == "system" and "【当前时间】" in msgs3[-1]["content"], \

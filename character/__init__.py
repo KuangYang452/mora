@@ -509,7 +509,7 @@ def selftest() -> None:
         "场景不应残留标签"
     t = c.instantiate("{{char_self}}是{{identity}}，{{user_ref}}你好，{{user}}再见")
     assert c.self_ref in t and c.identity in t and c.user_ref in t, t
-    assert "对方" in t, "{{user}} 应实例化为 user.ini 的称呼"
+    assert settings.user_ref() in t, "{{user}} 应实例化为 user.ini 的称呼"
     assert c.fallback("silent") and c.greeting_template()
     # 随机加载：多角色时不会崩
     r = load_character()

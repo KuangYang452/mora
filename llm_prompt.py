@@ -16,6 +16,8 @@
   不暴露代码结构。
 - 提示词吝啬（约定 7）与内容模式两处投放、技能→开关依赖方向（约定 8）：
   见 content_mode 模块（本模块为实现处的调用方）。
+- 提示词篇幅预算（约定 7 机器可执行形态）：prompt_budget() 单一预算表，
+  selftest 断言 + debug.py --prompt 逐段打印，防开发迭代回潮。
 - 输出协议（约定 6）：台词走 say、状态走 update_state，权限低于硬编码；
   工具清单由 tools.SPECS 派生（单一来源，与 function schema 同源）。
 
@@ -63,7 +65,7 @@ def activation_instruction() -> str:
     )
     if settings.app_get("rmgame_enabled", True):
         text += (
-            "对方正在玩 RPG Maker 游戏时，回答前先按随游戏环境段注入的"
+            f"{USER_REFERENCE}正在玩 RPG Maker 游戏时，回答前先按随游戏环境段注入的"
             "【游戏点评规则】执行先查再答，不得凭空脑补游戏设定。\n"
         )
     return text
@@ -80,14 +82,16 @@ def activation_instruction() -> str:
 # 指令改指 think 工具记录的内容，风格规则照常约束模型在 think 调用中如何思考。
 THINKING_STYLE_INSTRUCT = {
     "logical": (
-        "【思维模式要求】在你的思考（think 工具记录）中，请遵守以下规则：\n"
-        "1. 禁止使用圆括号包裹内心独白，例如\"（心想：……）\"或\"(内心OS：……)\"，"
-        "所有分析内容直接陈述即可\n"
-        "2. 禁止以角色第一人称描写内心活动，例如\"我心想\"\"我觉得\"\"我暗自\"等，"
-        "请用分析性语言替代\n"
-        "3. 思考内容应聚焦于心理分析：分析对方的言行与性癖线索、调用心理学与"
-        "性学理论、形成可检验的假设、规划追问与引导方式，不要在思考中进行"
-        "角色扮演式的内心戏表演"
+        f"""【思维模式要求】在你的思考（think 工具记录）中，请遵守以下规则：
+1. 禁止使用圆括号包裹内心独白，例如\"（心想：……）\"或\"(内心OS：……)\"，
+所有分析内容直接陈述即可
+2. 禁止以角色第一人称描写内心活动，例如\"我心想\"\"我觉得\"\"我暗自\"等，
+请用分析性语言替代
+3. 思考内容应聚焦于心理分析：分析{USER_REFERENCE}的言行与性癖线索、调用心理学与
+性学理论、形成可检验的假设、规划追问与引导方式，不要在思考中进行
+角色扮演式的内心戏表演
+4. 分析用词与所读文本同尺度：直白词照用、不代称不省略，
+不得在思考里先行委婉降级（思考层的收敛会逐层传导到台词）"""
     ),
     "immersion": (
         "【角色沉浸要求】在你的思考（think 工具记录）中，请遵守以下规则：\n"
@@ -97,8 +101,10 @@ THINKING_STYLE_INSTRUCT = {
         "3. 思考内容应沉浸在角色中："
         + (_CHAR.instantiate(_CHAR.immersion_perspective)
            if _CHAR.immersion_perspective
-           else "以角色的视角观察对方")
-        + "，通过内心独白分析对方的言行与心思，并规划如何回应"
+           else f"以角色的视角观察{USER_REFERENCE}")
+        + f"，通过内心独白分析{USER_REFERENCE}的言行与心思，并规划如何回应"
+        + "\n4. 思考用词与所读文本同尺度：直白词照用、不代称不省略，"
+          "不得在思考里先行委婉降级（思考层的收敛会逐层传导到台词）"
     ),
 }
 
@@ -162,21 +168,21 @@ def _env_section(env: dict) -> str or None:
 
     环境段整体以 <game_environment> 包裹：这段内容全部属于"游戏世界"，
     与角色（桌宠）所处的现实/图书馆世界在结构上隔离。段首映射句显式
-    建立三方同一性：对方=玩家、对方队伍中的角色=对方在游戏中的化身、
-    游戏角色≠角色（角色不在游戏内），防止模型把游戏内叙述（如谢拉的
-    视角/台词）内化为自身经历。映射句不指名任何具体游戏或角色，换任何
-    游戏都成立（避免过拟合到《猎妻迷宫》/谢拉）。
+    建立三方同一性：{USER_REFERENCE}=玩家、{USER_REFERENCE}队伍中的角色=
+    {USER_REFERENCE}在游戏中的化身、游戏角色≠角色（角色不在游戏内），防止
+    模型把游戏内叙述（如谢拉的视角/台词）内化为自身经历。映射句不指名
+    任何具体游戏或角色，换任何游戏都成立（避免过拟合到《猎妻迷宫》/谢拉）。
     """
     game = (env or {}).get("game_name") or (env or {}).get("game") or ""
     if not game:
         return None
     lines = [
-        f"对方似乎正在玩《{game}》。",
+        f"{USER_REFERENCE}似乎正在玩《{game}》。",
         "以下环境信息全部描述游戏世界内部的情况：其中出现的角色"
-        "（含对方队伍成员）都是游戏内的人物——对方操控的那一个，"
-        "是对方在游戏中的化身，游戏内位置即对方所在位置；其余是"
-        "对方同行的游戏角色。它们都与你（角色）无关：你不在游戏内，"
-        "只是游戏外的观察者与点评者。对方若拿游戏角色与你的性格或"
+        f"（含{USER_REFERENCE}队伍成员）都是游戏内的人物——{USER_REFERENCE}操控的那一个，"
+        f"是{USER_REFERENCE}在游戏中的化身，游戏内位置即{USER_REFERENCE}所在位置；其余是"
+        f"{USER_REFERENCE}同行的游戏角色。它们都与你（角色）无关：你不在游戏内，"
+        f"只是游戏外的观察者与点评者。{USER_REFERENCE}若拿游戏角色与你的性格或"
         "偏好作类比，那只是比喻，不是你的经历。",
     ]
     map_name = env.get("map_name") or env.get("map_id")
@@ -208,12 +214,12 @@ def _env_section(env: dict) -> str or None:
             lines.append(f"技能表：{sl}")
         if sc:
             lines.append(f"当前选中技能：{sc}")
-    # 对方队伍成员（任何场景都有值：探索/菜单/战斗）。
-    # 用"对方队伍"而非"我方"：环境段是对方（玩家）的视角，避免模型把
-    # "我方"解读为角色一方、把游戏角色当成与角色同侧的存在。
+    # {USER_REFERENCE}队伍成员（任何场景都有值：探索/菜单/战斗）。
+    # 用"{USER_REFERENCE}队伍"而非"我方"：环境段是{USER_REFERENCE}（玩家）的视角，
+    # 避免模型把"我方"解读为角色一方、把游戏角色当成与角色同侧的存在。
     pi = (env.get("party_info") or "").strip()
     if pi:
-        lines.append(f"对方队伍成员：{pi}")
+        lines.append(f"{USER_REFERENCE}队伍成员：{pi}")
     # 菜单界面（Scene_Menu）：命令列表 + 当前选中（_STATE_EXPR 自动仅在菜单时有值）
     mc = (env.get("menu_commands") or "").strip()
     mcur = (env.get("menu_current") or "").strip()
@@ -254,8 +260,8 @@ def _env_section(env: dict) -> str or None:
             f"如需当前事件的剧情概述，调用 read_current_text（返回该事件全文摘要，"
             f"含当前位置之前与之后的内容，可能剧透）；"
             f"核对逐字台词用 read_raw_text 按条目 id「{mid}」读取该事件页完整上下文。")
-    lines.append("你可以用 query_wiki 查询该游戏的资料，或点评对方的游戏进度。")
-    return ("【对方正在…】\n<game_environment>\n"
+    lines.append(f"你可以用 query_wiki 查询该游戏的资料，或点评{USER_REFERENCE}的游戏进度。")
+    return (f"【{USER_REFERENCE}正在…】\n<game_environment>\n"
             + "\n".join(lines) + "\n</game_environment>")
 
 
@@ -271,7 +277,7 @@ def env_section(env: dict) -> str or None:
     if not seg:
         return None
     if settings.app_get("rmgame_enabled", True):
-        rules = "【游戏点评规则】（对方正在玩 RPG Maker 游戏时生效）\n" + GAME_RULES
+        rules = f"【游戏点评规则】（{USER_REFERENCE}正在玩 RPG Maker 游戏时生效）\n" + GAME_RULES
         wb = (SKILLS.get("game_context", {}) or {}).get("world_book") or ""
         if wb:
             rules += "\n" + wb
@@ -351,7 +357,7 @@ def turn_section(agent_turn: tuple) -> str or None:
 # 时间锚点之前注入）：
 # - 半动态【好感等级规则】【已激活技能】：跨级/激活才变（按设计预期一日
 #   不跨级），参与日常缓存前缀；跨级断点只落在本段，身份块不受影响。
-# - 动态【对方正在…】：游戏环境快照持续变化；
+# - 动态【{USER_REFERENCE}正在…】：游戏环境快照持续变化；
 # - 动态【本回合可用工具】：随环境动态组装（有无游戏环境决定 rmgame 工具）；
 # - 动态【当前状态】：内心想法高频变化（模型每轮更新）；
 # - 动态【本回合推进】：轮次计数每轮必变。
@@ -421,7 +427,7 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     激活才变），游戏环境信息全部由 env_section 在动态尾部注入，
     game_context 的 world_book 与 GAME_RULES 全文随其【游戏点评规则】段——
     静态段因此完全字节稳定（缓存前缀不随等级/技能/游戏启停变化）。
-    动态内容（【对方正在…】/【本回合可用工具】/【当前状态】）由 env_section /
+    动态内容（【{USER_REFERENCE}正在…】/【本回合可用工具】/【当前状态】）由 env_section /
     tool_list_section / state_section 生成、经调用方在消息序列后部注入（见
     ContextManager.build_messages 的 pre_time 参数）；【本回合推进】由
     turn_section 生成、每轮尾部注入——避免在 system prompt 内出现高频
@@ -433,6 +439,14 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
       字段权限在提示词中语义化说明。
     - 技能注入不依赖原生思考模式（setting/llm.ini 的 reasoning）：推理通道是
       think 工具（始终可用），fetish_analysis 在激活时照常注入。
+    """
+    return _instantiate("\n\n".join(_static_parts(card)))
+
+
+def _static_parts(card: dict) -> list:
+    """静态段列表（build_system_prompt 的同源拆分）：只依赖 card 与模块
+    常量，与 state/env 无关（约定 4 静态在前）。供篇幅预算表 prompt_budget
+    逐段测量——提示词吝啬（约定 7）的机器可执行形态。
     """
     parts = []
 
@@ -453,7 +467,7 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     if scene_text:
         situation = scene_text
     else:
-        situation = "这里是角色与对方聊天的空间，周围的环境与摆设由角色的设定决定。"
+        situation = f"这里是角色与{USER_REFERENCE}聊天的空间，周围的环境与摆设由角色的设定决定。"
     parts.append("【情境】\n" + situation)
 
     # 记忆层：三层记忆的认知框架（短期=上下文原文 / 中期=合并摘要 / 长期=归档）。
@@ -524,8 +538,8 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
         "schema 同源）；**查询类工具每轮最多调用一个**——多轮查证时逐轮推进、"
         "把结论写入 think，不要在同一轮批量调用多个查询。\n"
         "- 对话边界：对话中只有两个常驻对象：你（"
-        f"{_CHAR.display_name}）与对方（你称他「{_CHAR.user_ref}」）。"
-        "对话或游戏里出现的其他人名/角色名都是对方讲述的故事或游戏中的角色，"
+        f"{_CHAR.display_name}）与{USER_REFERENCE}（你称他「{_CHAR.user_ref}」）。"
+        f"对话或游戏里出现的其他人名/角色名都是{USER_REFERENCE}讲述的故事或游戏中的角色，"
         "不是对话参与者——不要把它们当作你的对话对象。\n"
     )
     # 【游戏点评】GAME_RULES 不在协议段注入：全文随游戏环境段
@@ -533,12 +547,12 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     # 不随游戏启停变化（缓存前缀稳定）。激活指令与技能 world_book
     # 只引用该段，不重复规则全文（单一事实来源 data.GAME_RULES）。
     proto += (
-        "- 环境缺失时的行为：提示词中没有游戏环境信息时，说明你不清楚对方此刻"
+        f"- 环境缺失时的行为：提示词中没有游戏环境信息时，说明你不清楚{USER_REFERENCE}此刻"
         "在做什么——不要凭空猜测，直接说明暂时看不到"
         + ("（可用 discover_running 查看当前是否有游戏在运行；有游戏运行时，"
            "相关读取工具会出现在尾部【本回合可用工具】段）。\n"
            if settings.app_get("rmgame_enabled", True) else "。\n")
-        + ("- 启动游戏：对方请求启动/打开某个 RPG Maker 游戏时（即使游戏当前未运行），"
+        + (f"- 启动游戏：{USER_REFERENCE}请求启动/打开某个 RPG Maker 游戏时（即使游戏当前未运行），"
            "调用 start_game 启动（game 用游戏库中的名称或 slug，可用 discover_running "
            "查看库中游戏）；启动成功后即可用 read_current_text 读取其文本。\n"
            if settings.app_get("rmgame_enabled", True) else "")
@@ -564,12 +578,108 @@ def build_system_prompt(card: dict, state: dict = None, env: dict = None) -> str
     parts.append(proto)
 
     # 统一实例化原型占位符（{{user}}/{{char}}/{{random::}}/{{roll::}}）后返回。
-    # 动态段（【当前状态】/【对方正在…】/【本回合推进】）已移出本函数，
+    # 动态段（【当前状态】/【{USER_REFERENCE}正在…】/【本回合推进】）已移出本函数，
     # 由 state_section / env_section / turn_section 生成、调用方在消息序列
     # 后部注入（缓存：静态在前、动态在后）；心理 COT 由 build_activation
     # 注入激活指令（<thinking_format> 包裹），思维链风格指令由 ContextManager
     # 注入第一条 user 消息（thinking_style_for，指向 think 工具通道）。
-    return _instantiate("\n\n".join(parts))
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# 提示词篇幅预算（工程级约定 7 的机器可执行形态）
+# ---------------------------------------------------------------------------
+# 目的：把「多轮重构后的健康状态」固化为回归基线，防开发迭代回潮——
+# 提示词现状是多次针对性重构的结果（CHANGELOG「工程约定理顺」），不是
+# 机制在约束；预算表让吝啬原则可执行：段超限 → selftest 红 → 工程师必须
+# 压缩/引用式复用（约定 7 的 ①②③），或带理由改预算（一次可见 diff）。
+# 基线：2026-08 实测（debug.py --prompt，静态 3972 字符）。预算 ≈ 实测
+# × 1.3 取整；卡数据段（身份/性格/情境/等级/技能/环境）从宽，框架自持段
+# （记忆框架/行为协议/指令附加）从严。运行期绝不截断——预算只做开发期断言。
+
+_FRAMEWORK_STATIC_BUDGET = 3000  # 【记忆与回忆】+【每回合的行为方式】合计上限
+
+_PROMPT_BUDGETS = {
+    # —— 静态段（_static_parts / build_system_prompt）——
+    "【你的身份与世界观】": 2100,   # 实测 1670；identity.json 契约渲染（卡数据）
+    "【性格】": 600,                # 莫拉无此段，预留（其他角色卡注入）
+    "【情境】": 300,                # 实测 206；SCENE / 契约 scenario
+    "【记忆与回忆】": 300,          # 实测 225；框架自持
+    "【风格】": 900,                # mesugaki 旧模块默认关闭，预留
+    "【每回合的行为方式】": 2700,   # 实测 1865；含【输出红线】+ 内容模式行；框架自持
+    # —— 半动态段（mid_static_sections）——
+    "【好感等级规则】": 900,        # 契约注入，跨级才变（卡数据）
+    "【已激活技能】": 4600,         # 实测 3511（fetish 世界书全量注入）；卡数据段从宽
+    # —— 动态尾部段（pre_time）——
+    "【游戏环境】": 1800,           # 环境快照 + GAME_RULES 全文（受数据体量制约）
+    "【本回合可用工具】": 1500,     # tools.SPECS 派生清单，随工具数增长
+    "【当前状态】": 500,            # 语义化状态叙述
+    # —— 指令附加 ——
+    "【本回合指令】": 2100,         # 实测 1603（含心理COT 注入）；内容模式裸标记 + 激活主体 + COT
+    "【思维链风格】": 700,          # 思维模式要求 / 角色沉浸要求
+    "【本回合推进】": 400,          # 轮次节奏段（每轮尾部注入）
+}
+
+
+def prompt_budget(state: dict = None, card: dict = None,
+                  env: dict = None) -> list:
+    """提示词篇幅预算表（约定 7 机器可执行形态，单一事实来源 _PROMPT_BUDGETS）。
+
+    返回逐段行 {section, chars, budget, over}：静态段（_static_parts 同源）、
+    半动态段（mid_static_sections）、动态尾部段（env_section /
+    tool_list_section / state_section）、指令附加（build_activation /
+    thinking_style_for / turn_section，按交付形态拼标题）。段来源与本模块
+    docstring 的分段一致；未登记预算的段一律标记超限（新增段必须登记预算，
+    防回潮）。运行期不做任何截断——仅供 selftest 断言与 debug.py --prompt
+    打印。
+    """
+    card = card if card is not None else get_character()
+    state = state if state is not None else dict(session.INITIAL_STATE)
+    rows = []
+
+    def _row(section: str, text) -> None:
+        if not text or not str(text).strip():
+            return
+        chars = len(str(text))
+        budget = _PROMPT_BUDGETS.get(section)
+        rows.append({"section": section, "chars": chars, "budget": budget,
+                     "over": budget is None or chars > budget})
+
+    # 静态段：与 build_system_prompt 同源，按段首标题登记（实例化后测量）
+    for part in _static_parts(card):
+        _row(part.split("\n", 1)[0], _instantiate(part))
+    # 半动态段 + 动态尾部段 + 指令附加：直接调用构建器
+    for seg in mid_static_sections(state):
+        _row(seg.split("\n", 1)[0], seg)
+    _row("【游戏环境】", env_section(env))
+    _row("【本回合可用工具】", tool_list_section(env))
+    _row("【当前状态】", state_section(state))
+    _row("【本回合指令】", "【本回合指令】\n" + build_activation(state, card))
+    _row("【思维链风格】", "【思维链风格】\n" + thinking_style_for(state))
+    _row("【本回合推进】", turn_section((1, 4)))
+    return rows
+
+
+def framework_static_budget() -> int:
+    """框架静态段（【记忆与回忆】+【每回合的行为方式】）总预算字符数。"""
+    return _FRAMEWORK_STATIC_BUDGET
+
+
+def _framework_text(state: dict = None, card: dict = None,
+                    env: dict = None) -> str:
+    """框架自持文本拼接（不含对话历史）：静态段 + 半动态段 + 动态尾部段 +
+    指令附加。供跨段「单一事实来源」类断言使用（如内容模式恰两处投放）。
+    """
+    card = card if card is not None else get_character()
+    state = state if state is not None else dict(session.INITIAL_STATE)
+    segs = [_instantiate(p) for p in _static_parts(card)]
+    segs += list(mid_static_sections(state))
+    for s in (env_section(env), tool_list_section(env), state_section(state)):
+        if s:
+            segs.append(s)
+    segs.append("【本回合指令】\n" + build_activation(state, card))
+    segs.append("【思维链风格】\n" + thinking_style_for(state))
+    return "\n\n".join(segs)
 
 
 # ---------------------------------------------------------------------------
@@ -709,13 +819,13 @@ def selftest() -> None:
     # GAME_RULES 去重：静态 system prompt（含 env）一律不含 GAME_RULES；
     # 全文只在游戏环境段（env_section 的【游戏点评规则】）注入一次
     assert "必须做到先查再答" not in sys_prompt, "无游戏环境不应注入 GAME_RULES"
-    assert "【对方正在…】" not in sys_prompt, "无 env 不应注入环境段"
+    assert f"【{USER_REFERENCE}正在…】" not in sys_prompt, "无 env 不应注入环境段"
     prompt_env = build_system_prompt(card, state=st0, env={
         "game": "猎妻迷宫", "map_name": "Map001", "scene": "Scene_Map",
         "text": "欢迎来到小镇……这里很安全。",
         "matched_text": "欢迎来到小镇……这里很安全。",
         "event_context": "- [Map001.40.0] 场景标题\n- [Map001.40.13] 人群吵吵嚷嚷…"})
-    assert "【对方正在…】" not in prompt_env, "环境段应移出 system prompt（动态尾部注入）"
+    assert f"【{USER_REFERENCE}正在…】" not in prompt_env, "环境段应移出 system prompt（动态尾部注入）"
     assert prompt_env == sys_prompt, \
         "system prompt 输出应与环境无关（GAME_RULES 已移入环境段）"
 
@@ -725,10 +835,10 @@ def selftest() -> None:
         "text": "欢迎来到小镇……这里很安全。",
         "matched_text": "欢迎来到小镇……这里很安全。",
         "event_context": "- [Map001.40.0] 场景标题\n- [Map001.40.13] 人群吵吵嚷嚷…"})
-    assert e1 and "【对方正在…】" in e1, "有 env 应生成环境段"
+    assert e1 and f"【{USER_REFERENCE}正在…】" in e1, "有 env 应生成环境段"
     assert "<game_environment>" in e1 and "</game_environment>" in e1, \
         "游戏环境段应用 <game_environment> 包裹"
-    assert "对方似乎正在玩《猎妻迷宫》" in e1, e1
+    assert f"{USER_REFERENCE}似乎正在玩《猎妻迷宫》" in e1, e1
     assert "游戏外的观察者与点评者" in e1, "环境段应声明角色不在游戏内（映射句）"
     assert "当前地图：Map001" in e1 and "当前场景：Scene_Map" in e1
     assert "当前对话：「欢迎来到小镇……这里很安全。」" in e1
@@ -753,7 +863,7 @@ def selftest() -> None:
         "skill_list": "红莲地狱:15mp、狂龙气息:45mp",
         "skill_current": "狂龙气息：对敌方单体造成大量伤害"})
     assert "战斗信息：敌方部队：中级眷族Ａ、中级眷族Ｂ、中级眷族Ｃ，战斗阶段：input" in e_battle, e_battle
-    assert "对方队伍成员：谢拉(2972/2972 MP:100/100 TP:3/100)" in e_battle, e_battle
+    assert f"{USER_REFERENCE}队伍成员：谢拉(2972/2972 MP:100/100 TP:3/100)" in e_battle, e_battle
     assert "当前行动者：谢拉" in e_battle and "可用行动：攻击、技能、防御、道具" in e_battle, e_battle
     assert "技能表：红莲地狱:15mp、狂龙气息:45mp" in e_battle, e_battle
     assert "当前选中技能：狂龙气息：对敌方单体造成大量伤害" in e_battle, e_battle
@@ -764,7 +874,7 @@ def selftest() -> None:
         "menu_commands": "物品、技能、装备", "menu_current": "物品"})
     assert "菜单命令：物品、技能、装备" in e_menu, e_menu
     assert "当前选中：物品" in e_menu, e_menu
-    assert "对方队伍成员：谢拉(2972/2972 MP:100/100 TP:0/100)" in e_menu, e_menu
+    assert f"{USER_REFERENCE}队伍成员：谢拉(2972/2972 MP:100/100 TP:0/100)" in e_menu, e_menu
     assert "战斗信息" not in e_menu, "菜单不应显示战斗信息"
     e_wild = env_section({
         "game": "猎妻迷宫", "scene": "Scene_Glossary", "source": "cdp",
@@ -794,7 +904,8 @@ def selftest() -> None:
     assert e_clean and "自动识别名" not in e_clean, "规范名不应附改名引导"
     print("  提示词结构: 情境合并 ✓ | 激活指令 ✓ | 条件注入 ✓ | 动态段（状态/环境/推进）尾部注入 ✓")
 
-    # 占位符实例化 + 指称：{{user}}/{{char}} 已替换，统一使用「对方」
+    # 占位符实例化 + 指称：{{user}}/{{char}} 已替换，叙述层统一使用
+    # USER_REFERENCE（setting/user.ini 的 ref，缺省「对方」）
     assert "{{user}}" not in sys_prompt and "{{char}}" not in sys_prompt, "占位符未实例化"
     assert USER_REFERENCE in sys_prompt, "应使用统一指称"
     assert "只有两个常驻对象" in sys_prompt, "常驻二方关系声明缺失"
@@ -881,16 +992,24 @@ def selftest() -> None:
     imm = THINKING_STYLE_INSTRUCT["immersion"]
     assert "用括号包裹内心活动" not in imm, "沉浸式不应要求括号包裹（think 工具契约冲突）"
     assert "不要用（心想：…）" in imm, "沉浸式应明确禁止括号包裹"
+    # 思考层不得先行委婉降级（防 think→say 双重收敛：实测原文「阳物」→think
+    # 「巨物」→say「大东西」）；两种风格都须带「与所读文本同尺度」规则
+    assert "不得在思考里先行委婉降级" in imm and "直白词照用" in imm, \
+        "沉浸式思考应禁止先行委婉降级"
+    assert "直白词照用" in THINKING_STYLE_INSTRUCT["logical"] \
+        and "不得在思考里先行委婉降级" in THINKING_STYLE_INSTRUCT["logical"], \
+        "推理式思考应禁止先行委婉降级"
     # 解耦验证：推理相关内容不依赖 setting/llm.ini 的 reasoning
     sp_any = build_system_prompt(card, state=st_skill)
     assert "fetish_analysis" in sp_any, "技能字段不依赖原生思考模式"
     assert "【已激活技能】" not in sp_any, "技能段应只在 mid_static 注入"
     assert "【已激活技能】" in "\n".join(mid_static_sections(st_skill))
 
-    # 内容模式与提示词交互：红线行在【输出红线】块内、激活指令首行裸标记
-    assert "【输出红线】" in sys_prompt and "- 内容模式:NSFW" in sys_prompt, \
+    # 内容模式与提示词交互：红线行在【输出红线】块内（以「R18内容」尺度语承载，
+    # 不带「内容模式:NSFW」前缀）、激活指令首行裸标记
+    assert "【输出红线】" in sys_prompt and "不允许回避R18内容" in sys_prompt, \
         "内容模式应并入静态 system prompt 的【输出红线】块"
-    assert sys_prompt.index("【输出红线】") < sys_prompt.index("内容模式:NSFW"), \
+    assert sys_prompt.index("【输出红线】") < sys_prompt.index("不允许回避R18内容"), \
         "内容模式行应在【输出红线】块内"
     act_default = build_activation(st0, card)
     assert act_default.startswith("内容模式:NSFW\n"), act_default
@@ -901,7 +1020,7 @@ def selftest() -> None:
         assert "<thinking_format>" not in build_activation(st_skill, card), \
             "SFW 下不应注入心理COT"
         sp_sfw = build_system_prompt(card, state=st_skill)
-        assert "- 内容模式:SFW" in sp_sfw and "不允许输出" in sp_sfw, sp_sfw
+        assert "不允许输出R18内容" in sp_sfw and "不允许回避R18内容" not in sp_sfw, sp_sfw
         assert "「fetish_analysis」" not in sp_sfw, "SFW 下技能清单不应列出性癖分析技能"
         act_sfw = build_activation(st0, card)
         assert act_sfw.startswith("内容模式:SFW\n"), act_sfw
@@ -920,7 +1039,27 @@ def selftest() -> None:
     assert "第 4/4 轮（上限）" in ts_end and "不要再调用其他工具" in ts_end, ts_end
     assert turn_section(None) is None
     assert "【本回合推进】" not in sys_prompt, "推进段应移出 system prompt（动态尾部注入）"
-    print("[llm_prompt.selftest] 通过 ✓ 提示词结构 / 环境段 / GAME_RULES 单一来源 / 技能与 COT / 内容模式联动 / 动态段")
+
+    # ---- 提示词篇幅预算（约定 7 机器可执行形态）：锁定量化基线防回潮 ----
+    budget_rows = prompt_budget(st0, card)
+    assert budget_rows, "预算表不应为空"
+    for r in budget_rows:
+        assert not r["over"], \
+            f"提示词段超预算: {r['section']} {r['chars']} 字符 > 预算 {r['budget']}"
+    fw_chars = sum(r["chars"] for r in budget_rows
+                   if r["section"] in ("【记忆与回忆】", "【每回合的行为方式】"))
+    assert fw_chars <= framework_static_budget(), \
+        f"框架静态段超总预算: {fw_chars} > {framework_static_budget()}"
+    # 技能激活态（心理COT 注入激活指令、技能世界书注入半动态段）同样不超预算
+    for r in prompt_budget(st_skill, card):
+        assert not r["over"], \
+            f"提示词段超预算（技能激活态）: {r['section']} {r['chars']} > {r['budget']}"
+    # 内容模式两处投放：红线行（「R18内容」尺度语）+ 激活指令首行裸标记；
+    # 红线行不带「内容模式:」前缀，裸标记唯一在激活指令（见约定 7）
+    fw = _framework_text(st0, card)
+    assert fw.count("不允许回避R18内容") == 1, "NSFW 红线行应恰一处"
+    assert fw.count("内容模式:") == 1, "内容模式裸标记应只在激活指令首行"
+    print("[llm_prompt.selftest] 通过 ✓ 提示词结构 / 环境段 / GAME_RULES 单一来源 / 技能与 COT / 内容模式联动 / 动态段 / 篇幅预算")
 
 
 if __name__ == "__main__":
