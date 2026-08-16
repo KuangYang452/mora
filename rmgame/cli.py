@@ -24,7 +24,8 @@ import tempfile
 from pathlib import Path
 
 from .discovery import (
-    RAW_DIR, RUNTIME_DIR, GameInfo, discover, load_games, register,
+    RAW_DIR, RUNTIME_DIR, GameInfo, discover, is_auto_hash, load_games,
+    register, rename_game,
 )
 from .extract import extract_game, write_raw
 from .monitor import load_current, monitor_loop, port_for, start_game
@@ -394,10 +395,13 @@ def selftest() -> int:
         found = discover(tmp / "games", recursive=True)
         assert len(found) == 2, f"应发现 2 个游戏，实际 {len(found)}"
         by_engine = {g.engine: g for g in found}
-        assert by_engine["mv"].slug == "演示游戏", by_engine["mv"]
-        assert by_engine["mz"].slug == "mzdemo", by_engine["mz"]
+        # 自动命名一律哈希占位（无先入为主/无重名），真名入别名
+        assert is_auto_hash(by_engine["mv"].name), by_engine["mv"]
+        assert is_auto_hash(by_engine["mz"].name), by_engine["mz"]
+        assert "演示游戏" in by_engine["mv"].aliases, by_engine["mv"].aliases
+        assert "MZDemo" in by_engine["mz"].aliases, by_engine["mz"].aliases
         assert by_engine["mz"].data_dir.endswith("data"), by_engine["mz"]
-        print("  discovery: MV/MZ 识别 ✓")
+        print("  discovery: MV/MZ 识别（自动命名哈希占位 + 真名入别名）✓")
 
         # 注册 + 幂等
         merged = register(found)
@@ -406,6 +410,15 @@ def selftest() -> int:
         assert all(getattr(g, "launch_mode", "") == "auto" for g in merged), merged
         assert all(g.launch_mode == "auto" for g in load_games()), load_games()
         print("  register: 入库 + 幂等 + launch_mode 默认 auto ✓")
+
+        # 角色命名：哈希占位 → rename_game 赋予正式名称（迫使莫拉起名的闭环；
+        # slug 随新名重算，旧哈希名并入别名）
+        _gm, _m1 = rename_game(by_engine["mv"].slug, "演示游戏")
+        _gz, _m2 = rename_game(by_engine["mz"].slug, "MZDemo")
+        assert _gm is not None and _gz is not None, (_m1, _m2)
+        assert next(x for x in load_games() if x.slug == "演示游戏")
+        assert next(x for x in load_games() if x.slug == "mzdemo")
+        print("  rename_game: 哈希占位 → 正式命名（slug 随名迁移）✓")
 
         # 提取（默认对话）
         g = next(x for x in load_games() if x.slug == "演示游戏")
@@ -864,25 +877,28 @@ def selftest() -> int:
             assert next(x for x in load_games()
                         if x.slug == "自动发现演示").trust == "user", \
                 "auto_register 不应降级已确认游戏"
-            rows6b = [(str(_make_fake_game(tmp / "games7", "自动发现二号", "mz")
-                          / "Game.exe"), "", "502")]
+            auto2_dir = _make_fake_game(tmp / "games7", "自动发现二号", "mz")
+            rows6b = [(str(auto2_dir / "Game.exe"), "", "502")]
             n6b = mon6.monitor_loop_all([], interval=0, max_rounds=1,
                                         enum_fn=lambda: rows6b)
             assert n6b == 1
-            g6b2 = next(x for x in load_games() if x.slug == "自动发现二号")
+            # 自动入库：哈希占位名（真名「自动发现二号」在 aliases），trust=auto
+            g6b2 = next(x for x in load_games() if x.dir == str(auto2_dir))
+            assert is_auto_hash(g6b2.name), g6b2
             assert g6b2.trust == "auto" and g6b2.last_seen, g6b2
             total_before = len(load_games())
             mon6.monitor_loop_all([], interval=0, max_rounds=1,
                                   enum_fn=lambda: rows6b)
             assert len(load_games()) == total_before, "重复发现不应重复入库"
             # 回调 on_auto_register：仅首次自动入库触发，重复轮次不触发
-            rows6c = [(str(_make_fake_game(tmp / "games8", "自动发现三号", "mv")
-                          / "Game.exe"), "", "503")]
+            auto3_dir = _make_fake_game(tmp / "games8", "自动发现三号", "mv")
+            rows6c = [(str(auto3_dir / "Game.exe"), "", "503")]
             cb6 = []
             mon6.monitor_loop_all([], interval=0, max_rounds=1,
                                   enum_fn=lambda: rows6c,
                                   on_auto_register=cb6.append)
-            assert len(cb6) == 1 and cb6[0].slug == "自动发现三号", cb6
+            assert len(cb6) == 1 and cb6[0].dir == str(auto3_dir), cb6
+            assert is_auto_hash(cb6[0].name), cb6
             mon6.monitor_loop_all([], interval=0, max_rounds=1,
                                   enum_fn=lambda: rows6c,
                                   on_auto_register=cb6.append)
@@ -894,7 +910,7 @@ def selftest() -> int:
         # 5) bridge discover_running：入库状态标注（monkeypatch 枚举避免真实 PowerShell）
         _orig_enum = mon6.enumerate_running
         mon6.enumerate_running = lambda enum_fn=None: (
-            [next(x for x in load_games() if x.slug == "自动发现二号")], {})
+            [next(x for x in load_games() if x.dir == str(auto2_dir))], {})
         try:
             r_dr = et6("discover_running", {})
             assert "自动发现二号" in r_dr and "待允许启动" in r_dr, r_dr
@@ -905,6 +921,7 @@ def selftest() -> int:
         finally:
             mon6.enumerate_running = _orig_enum
         # 6) start_game 信任闸门：trust=auto 拒绝并给 UI 确认指引
+        #    （哈希名条目经 aliases「自动发现二号」命中）
         r_sg = et6("start_game", {"game": "自动发现二号"})
         assert "还不能启动" in r_sg and "确认气泡" in r_sg \
             and "🎮 游戏" in r_sg, r_sg
@@ -917,7 +934,7 @@ def selftest() -> int:
                                    running=False, approve="自动发现二号")
         assert cs6(ns_ap) == 0, "approve 应成功"
         assert next(x for x in load_games()
-                    if x.slug == "自动发现二号").trust == "user"
+                    if x.dir == str(auto2_dir)).trust == "user"
         ns_no = argparse.Namespace(root=None, recursive=True, yes=False,
                                    running=False, approve="不存在游戏")
         assert cs6(ns_no) == 1, "无记录应报错"
@@ -941,14 +958,15 @@ def selftest() -> int:
         found7 = discover(base7, recursive=True)
         assert len(found7) == 1, found7
         g7 = found7[0]
-        from .discovery import make_slug as ms7
-        assert g7.name == "輪淫のスピンドル", g7.name      # 目录名无意义 → 引擎标题
-        assert g7.slug == ms7("輪淫のスピンドル"), g7.slug
-        assert "[JP][ver1.11]" in g7.aliases, g7.aliases  # 目录名入别名
+        # 自动命名一律哈希占位；真实名称（引擎标题/父目录段/子目录名）全部入别名
+        assert is_auto_hash(g7.name), g7.name
+        assert "輪淫のスピンドル" in g7.aliases, g7.aliases  # System.json gameTitle
+        assert "[JP][ver1.11]" in g7.aliases, g7.aliases  # 子目录名入别名
         assert "淫乱轮轴" in g7.aliases and "Spindle" in g7.aliases, g7.aliases
-        print("  M7 discovery: 版本子目录 → System.json gameTitle 择优 + 父目录拆别名 ✓")
+        print("  M7 discovery: 版本子目录 → 哈希占位 + 引擎标题/父目录段入别名 ✓")
 
-        # register 自愈：旧条目（版本号名）同目录命中 → 刷新 name/aliases，slug 稳定
+        # register 自愈：旧条目（版本号名）同目录命中 → 刷新 aliases，slug 稳定；
+        # 已有实质名不被哈希自动名覆盖
         old7 = GameInfo(slug="jp-ver1-11", name="[JP][ver1.11]",
                         exe_path=str(pkg7 / "Game.exe"), dir=str(pkg7),
                         engine="mv", data_dir=str(d7))
@@ -957,9 +975,10 @@ def selftest() -> int:
         assert len(merged7) == 1, "不应重复入库"
         g7r = next(x for x in merged7 if x.dir == str(pkg7))
         assert g7r.slug == "jp-ver1-11", g7r.slug          # slug 稳定（数据目录不变）
-        assert g7r.name == "輪淫のスピンドル", g7r.name
+        assert g7r.name == "[JP][ver1.11]", g7r.name       # 已有实质名不被哈希覆盖
+        assert "輪淫のスピンドル" in g7r.aliases, g7r.aliases
         assert "淫乱轮轴" in g7r.aliases, g7r.aliases
-        print("  M7 register: 同目录自愈刷新 name/aliases（slug 稳定）✓")
+        print("  M7 register: 同目录自愈（已有名不被哈希覆盖，别名刷新）✓")
 
         # _resolve_game：name / aliases / slug 三种叫法均命中
         from .bridge import _resolve_game as rg7
@@ -968,16 +987,17 @@ def selftest() -> int:
             assert gg7 is not None and gg7.slug == "jp-ver1-11", (key7, err7)
         print("  M7 bridge: _resolve_game 命中 name / aliases / slug ✓")
 
-        # 目录名有意义时保留目录名（防引擎标题带版本尾巴反而更差，猎妻迷宫场景）
+        # 目录名/引擎标题全部入别名（防引擎标题带版本尾巴反而更差，猎妻迷宫场景）
         g7e = _make_fake_game(tmp / "games7b", "猎妻迷宫", "mv")
         (g7e / "www" / "data" / "System.json").write_text(
             json.dumps({"gameTitle": "猎妻迷宫_BokiBoki官方中文版ver107"},
                        ensure_ascii=False), encoding="utf-8")
         found7e = discover(tmp / "games7b", recursive=True)
-        assert found7e[0].name == "猎妻迷宫", found7e[0].name
+        assert is_auto_hash(found7e[0].name), found7e[0].name
+        assert "猎妻迷宫" in found7e[0].aliases, found7e[0].aliases
         assert "猎妻迷宫_BokiBoki官方中文版ver107" in found7e[0].aliases, \
             found7e[0].aliases
-        print("  M7 discovery: 目录名有意义 → 保留目录名（engine_title 入别名）✓")
+        print("  M7 discovery: 目录名/引擎标题入别名（自动命名哈希占位）✓")
 
         print("[rmgame.selftest] 全部通过 ✓")
         return 0

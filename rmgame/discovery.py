@@ -18,6 +18,7 @@
 import json
 import os
 import re
+import hashlib
 import datetime as _dt
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
@@ -79,6 +80,33 @@ def make_slug(name: str) -> str:
     s = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "-", name.strip()).strip("-")
     s = s.lower()
     return s or "game"
+
+
+# 自动命名哈希占位（如 game-a1b2c3d4e5）：发现结果一律以此命名，正式名称
+# 由角色/用户经 rename_game 赋予（见 _build_info 说明）
+_AUTO_NAME_RE = re.compile(r"^game-[0-9a-f]{10}$")
+
+
+def _auto_hash_name(game_dir: Path) -> str:
+    """自动命名占位名：基于游戏目录绝对路径的短哈希（稳定、唯一）。
+
+    同目录永远同哈希（幂等）；不同目录几乎不可能碰撞 —— 彻底避免引擎
+    默认包名（如 MZ 的 rmmz-game）造成的命名重复与先入为主。
+    """
+    digest = hashlib.sha256(
+        str(game_dir.resolve()).encode("utf-8")).hexdigest()
+    return f"game-{digest[:10]}"
+
+
+def is_auto_hash(name: str) -> bool:
+    """是否自动命名哈希占位（发现结果，尚未经 rename_game 正式命名）。"""
+    return bool(_AUTO_NAME_RE.match(name or ""))
+
+
+# 引擎默认包名等通用名：不收入别名（避免多游戏共享同一通用名导致
+# 按别名解析歧义 —— 正是两个 rmmz-game 撞名的根源之一）
+_GENERIC_ALIAS_RE = re.compile(
+    r"^(?:rmmv-game|rmmz-game|game|mz|mv|project\d*)$", re.I)
 
 
 def load_games() -> list:
@@ -159,14 +187,14 @@ def _collect_aliases(game_dir: Path, engine_title: str, pkg_name: str,
     """
     names = []
     for s in (engine_title, pkg_name, game_dir.name):
-        if s and s not in names:
+        if s and s not in names and not _GENERIC_ALIAS_RE.match(s):
             names.append(s)
     if not dir_meaningful:
         parent = game_dir.parent.name
         if parent:
             for p in re.split(r"[\[\]]+", parent):
                 p = p.strip()
-                if p and p not in names:
+                if p and p not in names and not _GENERIC_ALIAS_RE.match(p):
                     names.append(p)
     return names
 
@@ -219,22 +247,18 @@ def _is_engine(game_dir: Path, exe: Path) -> GameInfo or None:
 
 def _build_info(game_dir: Path, exe: Path, engine: str, data_dir: Path,
                 pkg_name: str, pkg_main: str, engine_title: str = "") -> GameInfo:
-    """构建 GameInfo：名称择优 + 自动采集别名。
+    """构建 GameInfo：自动命名一律哈希占位，真实名称全部收进 aliases。
 
-    名称优先级：
-    1. 目录名剥掉版本/标记后仍有实质内容 → 用目录名（打包者的组织名，
-       如「猎妻迷宫」；也避免引擎标题带版本尾巴反而更差）；
-    2. 否则用引擎标题（System.json gameTitle / Game.ini Title，如
-       「輪淫のスピンドル」而非版本子目录 [JP][ver1.11]）；
-    3. 再否则 package.json name；最后目录名兜底。
-    引擎标题与目录名等全部收进 aliases 供匹配（_resolve_game 命中任一即可）。
+    自动命名使用基于游戏目录的哈希（稳定唯一、无先入为主、无重名——
+    引擎默认包名如 rmmz-game 会被多个游戏共享而撞名，见 _auto_hash_name）；
+    正式名称由角色/用户经 rename_game 赋予（迫使莫拉起名）。
+    可匹配名称（引擎标题 System.json gameTitle / Game.ini Title、
+    package.json name、目录名；目录名无意义时父目录拆段）全部收进
+    aliases 供匹配（_resolve_game 命中任一即可）。
     """
     dir_name = game_dir.name
     dir_meaningful = _meaningful_dir_name(dir_name)
-    if engine_title and not dir_meaningful:
-        name = engine_title
-    else:
-        name = pkg_name or dir_name
+    name = _auto_hash_name(game_dir)
     slug = make_slug(name)
     aliases = [a for a in _collect_aliases(game_dir, engine_title, pkg_name,
                                            dir_meaningful)
@@ -313,8 +337,11 @@ def register(games: list, replace: bool = False) -> list:
         old = by_dir.get(g.dir)
         if old is not None:
             # 已入库：仅刷新显示名与别名（slug 稳定）
-            # 手动命名条目（name_manual）不被自动检测名覆盖；新检测名并入别名
-            if not old.name_manual and old.name != g.name:
+            # 手动命名条目（name_manual）不被自动检测名覆盖；新检测名并入别名。
+            # 自动检测名现在是哈希占位（_build_info），一律不覆盖已有实质名
+            # （否则 猎妻迷宫 等已有名称会在下次发现时被改成 game-xxxx）。
+            if (not old.name_manual and old.name != g.name
+                    and not is_auto_hash(g.name)):
                 old.name = g.name
             if not old.name_manual:
                 if old.aliases != g.aliases:
@@ -349,7 +376,8 @@ def auto_register(info: GameInfo) -> bool:
             # 同目录已入库：仅刷新更权威的 name / aliases（slug 稳定）；
             # 手动命名条目（name_manual）不被自动名覆盖，新检测名并入别名
             changed = False
-            if not getattr(g, "name_manual", False) and g.name != info.name:
+            if (not getattr(g, "name_manual", False) and g.name != info.name
+                    and not is_auto_hash(info.name)):
                 g.name = info.name
                 changed = True
             if not getattr(g, "name_manual", False):

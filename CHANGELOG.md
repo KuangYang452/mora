@@ -126,6 +126,19 @@
   拿到「尚无 wiki 概念」）；修复后动作类不入重复查询校验、不计查询限一数量、
   不计查询计数（`_queried_count`），可与查询同轮执行。
 
+- **游戏自动命名改为哈希占位，正式名称交由角色命名**（`rmgame/discovery.py` /
+  `rmgame/cli.py`）：自动发现/自动入库的游戏一律以基于目录绝对路径的短哈希
+  命名（`game-<10位hex>`，如 `game-12816fec2c`），正式名称由角色/用户经
+  `rename_game` 赋予（迫使莫拉起名）——彻底避免引擎默认包名（MZ 的
+  `rmmz-game`）多游戏撞名与先入为主（实测：两个 MZ 游戏都被自动发现为
+  `rmmz-game`，手动改名把「幽世村」错挂到监狱勇者条目、真幽世村只能以
+  `rmmz-game` 身份入库，`query_wiki`/`read_current_text` 按「幽世村」解析
+  全部错位）。引擎标题（System.json gameTitle）/目录名/包名等可匹配名称全部
+  收进 aliases（通用包名如 `rmmz-game` 剔除，防按别名解析歧义）；register /
+  auto_register 刷新时哈希占位名**不覆盖已有实质名**（猎妻迷宫 等旧库名称
+  稳定，不因下次发现被改成哈希）；selftest 同步改为「发现=哈希 + 真名入别名
+  + rename_game 闭环」断言。
+
 ## [2.0.0] - 2026-08-16
 
 ### 新增（1.2 易用性，见 docs/1.2_USABILITY_PLAN.md）
