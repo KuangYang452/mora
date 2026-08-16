@@ -37,6 +37,9 @@ class ToolSpec:
     description: str = ""                       # function schema 的 description
     returns: str = ""                           # 返回内容简述（提示词清单用）
     is_query: bool = False                      # 查询类（意向-动作校验）
+    is_action: bool = False                     # 构建/操作类（is_query 但语义是
+                                                # 动作而非重复读取同一内容：豁免
+                                                # 重复查询/查询限一校验，见 pet）
     is_game_world: bool = False                 # 游戏世界类（<game_data> 包裹）
     rmgame: bool = False                        # RPG Maker 工具（受开关控制）
     executor: Optional[Callable] = None         # 执行体（args, ctx）→ 语义化文本；
@@ -226,7 +229,8 @@ SPECS: list = [
         executor=_make_rmgame_executor("query_wiki"),
     ),
     ToolSpec(
-        name="scan_game", rmgame=True, is_query=True, is_game_world=True,
+        name="scan_game", rmgame=True, is_query=True, is_action=True,
+        is_game_world=True,
         desc="扫描游戏全部文本并重建 wiki 概念骨架",
         description=(
             "扫描某游戏的全部文本并重建 wiki 概念骨架（提取 raw + 概念发现）。"),
@@ -260,7 +264,8 @@ SPECS: list = [
         executor=_make_rmgame_executor("read_raw_text"),
     ),
     ToolSpec(
-        name="wiki_arbitrate", rmgame=True, is_query=True, is_game_world=True,
+        name="wiki_arbitrate", rmgame=True, is_query=True, is_action=True,
+        is_game_world=True,
         desc="剧情摘要与 wiki 词条冲突时以原文裁决",
         description=(
             "当剧情摘要（当前事件信息）与 wiki 词条内容冲突时，调用本工具以游戏原文（raw）"
@@ -280,7 +285,8 @@ SPECS: list = [
         executor=_make_rmgame_executor("wiki_arbitrate"),
     ),
     ToolSpec(
-        name="wiki_rebuild", rmgame=True, is_query=True, is_game_world=True,
+        name="wiki_rebuild", rmgame=True, is_query=True, is_action=True,
+        is_game_world=True,
         desc="强制重建 wiki 概念条目（以原文为准）",
         description=(
             "强制重建某游戏的 wiki 概念条目：以原文（raw）为准重新生成条目内容；"
@@ -398,6 +404,18 @@ def query_names(rmgame_enabled: bool = True) -> set:
     return {s.name for s in specs(rmgame_enabled) if s.is_query}
 
 
+def action_names(rmgame_enabled: bool = True) -> set:
+    """构建/操作类工具名集合（is_query 但语义是动作：scan_game / wiki_rebuild /
+    wiki_arbitrate）。
+
+    它们由查询结果**引导的下一个动作**（如 query_wiki 返回「尚无概念」→ 应
+    scan_game 构建骨架），不是对同一内容的重复读取；pet 的重复查询/查询限一
+    校验需豁免，否则模型按引导执行时会被误拦（实测日志 221140：scan_game
+    被「重复查询校验重试」替换，wiki 骨架从未构建）。
+    """
+    return {s.name for s in specs(rmgame_enabled) if s.is_action}
+
+
 def game_world_names(rmgame_enabled: bool = True) -> set:
     """游戏世界类工具名集合（结果用 <game_data> 包裹回传）。"""
     return {s.name for s in specs(rmgame_enabled) if s.is_game_world}
@@ -438,6 +456,12 @@ def selftest() -> None:
     assert len(off) == len(on) - 9, "rmgame 关闭时应剔除 9 个工具"
     assert "say" not in prompt_names(), "say 不列入提示词清单"
     assert query_names() <= game_world_names(), "查询类工具应属游戏世界类（<game_data> 包裹）"
+    # 构建/操作类（is_action）：is_query 的子集，语义是动作而非重复读取
+    # （scan_game / wiki_rebuild / wiki_arbitrate）；pet 的重复查询/查询限一
+    # 校验豁免它们（见 action_names 注释，实测日志 221140 scan_game 被误拦）
+    assert action_names() == {"scan_game", "wiki_rebuild", "wiki_arbitrate"}, \
+        action_names()
+    assert action_names() <= query_names(), "动作类应同时是查询类（is_query 子集）"
     # think 通用推理通道：非 rmgame（开关过滤不剔除）、非查询、非游戏世界
     assert "think" in {s.name for s in on} and "think" in {s.name for s in off}, \
         "think 不应受 rmgame 开关影响"
@@ -462,7 +486,8 @@ def selftest() -> None:
     out = mn({"action": "list"}, None)
     assert isinstance(out, str) and out, "mora_notes 执行体应返回语义化文本"
     print(f"  tools 注册表: {len(SPECS)} 个工具（rmgame 9 + 内建/归档/笔记/think）"
-          f" | 查询类 {len(query_names())} | 游戏世界类 {len(game_world_names())}"
+          f" | 查询类 {len(query_names())} | 动作类 {len(action_names())}"
+          f" | 游戏世界类 {len(game_world_names())}"
           f" | executor 接线 {sum(1 for s in SPECS if s.executor)} + 内建 3 ✓")
 
 

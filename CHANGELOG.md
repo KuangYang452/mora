@@ -116,6 +116,16 @@
   assistant 后必须紧跟每个 `tool_call_id` 的 tool 消息，否则 400；`tool_calls`
   为空时整个字段缺省——空数组同样会被 400 拒绝，实测日志 220817）。
 
+- **构建/操作类工具豁免「重复查询/查询限一」校验**（`tools.py` / `pet.py`）：
+  `ToolSpec` 新增 `is_action` 分类（`tools.action_names()` 派生集合），
+  `scan_game` / `wiki_rebuild` / `wiki_arbitrate` 标记为动作类——它们是查询
+  结果的**后续动作**（如 `query_wiki` 返回「尚无概念」后正应 `scan_game` 构建
+  骨架），不是对同一内容的重复读取。此前它们被 `is_query` 归入查询类，模型按
+  引导执行 `scan_game` 时会被「重复查询校验」误拦成修复指令重试、动作从未
+  执行（实测日志 221140：`scan_game` 被替换，wiki 骨架从未构建、LLM 始终只
+  拿到「尚无 wiki 概念」）；修复后动作类不入重复查询校验、不计查询限一数量、
+  不计查询计数（`_queried_count`），可与查询同轮执行。
+
 ## [2.0.0] - 2026-08-16
 
 ### 新增（1.2 易用性，见 docs/1.2_USABILITY_PLAN.md）

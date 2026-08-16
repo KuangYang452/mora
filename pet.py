@@ -78,11 +78,17 @@ BUBBLE_MAX_W = 340      # 气泡最大像素宽
 # 全量集合对校验/包裹判定与按开关过滤等价，且不随运行期开关变化而失效。
 _QUERY_TOOL_NAMES = tools.query_names()
 _GAME_TOOL_NAMES = tools.game_world_names()
+# 构建/操作类工具（is_action）：is_query 子集，但语义是**动作**而非重复读取
+# 同一内容——query_wiki 返回「尚无概念」后正应调用 scan_game 构建骨架，
+# 此类工具不得被「重复查询/查询限一」校验误拦（实测日志 221140：scan_game
+# 被重复查询校验替换成修复指令，wiki 骨架从未构建；见 tools.action_names）。
+_QUERY_ACTION_NAMES = tools.action_names()
 # 查询限一校验（防批量查询撑爆结果区预算）：每轮最多一个**大结果**查询
-# 工具（结果可能很大的查询；discover_running 只返回小名称列表，不计入）。
+# 工具（结果可能很大的查询；discover_running 只返回小名称列表，不计入；
+# 动作类工具同不计入——它们是查询结果的后续动作，可与查询同轮执行）。
 # 隐性篇幅上限 = 两次查询结果之和（保留最近两轮、不截断），见 _request_llm。
 _QUERY_LIMIT_NAMES = (_QUERY_TOOL_NAMES | {"query_archive"}) \
-    - {"discover_running"}
+    - {"discover_running"} - _QUERY_ACTION_NAMES
 
 # 上次对话距今多久的语义化描述；过近（<60 秒）或无法解析返回 None
 # ---------------------------------------------------------------------------
@@ -900,12 +906,17 @@ class MoraPet:
                 # 见日志 0559xx：同一输入内 read+wiki 重复 3 轮、返回逐字相同
                 # （快照/词条均未变化），think 结论每轮重写——查询结果只保留
                 # 最近两轮，think 轮后更早结果已从上下文移除，模型被迫重查。
+                # 动作类工具（scan_game/wiki_rebuild/wiki_arbitrate）豁免：
+                # 它们是查询结果的**后续动作**，非重复读取（见 _QUERY_ACTION_NAMES，
+                # 实测日志 221140 scan_game 被误拦、wiki 骨架从未构建）。
                 # 防死循环：每子轮最多重试 1 次；重试结果无条件接受，不递归。
                 if (settings.app_get("retry_on_repeated_query", True)
                         and not retried_this_turn
                         and self._queried_count >= 1
-                        and any(c["name"] in _QUERY_TOOL_NAMES
-                               or c["name"] == "query_archive" for c in calls)
+                        and any((c["name"] in _QUERY_TOOL_NAMES
+                                 or c["name"] == "query_archive")
+                                and c["name"] not in _QUERY_ACTION_NAMES
+                                for c in calls)
                         and not any(c["name"] == "say" for c in calls)):
                     fix_msgs = messages + [
                         {"role": "assistant", "content": msg.get("content") or ""},
@@ -1042,7 +1053,9 @@ class MoraPet:
                     asst_msg["tool_calls"] = real_tc
                 agent_msgs.append(asst_msg)
                 for c in real_calls:
-                    if c["name"] in _QUERY_TOOL_NAMES or c["name"] == "query_archive":
+                    if ((c["name"] in _QUERY_TOOL_NAMES
+                         or c["name"] == "query_archive")
+                            and c["name"] not in _QUERY_ACTION_NAMES):
                         self._queried_before = True   # 已实际调用过查询工具
                         self._queried_count += 1      # 本输入内查询调用计数（重复查询校验）
                     _spec = tools.by_name(c["name"])
