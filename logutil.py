@@ -112,13 +112,16 @@ MAX_LLM_LOGS = 50            # 通用 LLM 调用日志保留条数（llm_*.txt�
 
 def log_llm_call(kind: str, prompt: str, response: str,
                  ok: bool = True, note: str = "",
-                 reasoning: str = "", cache: str = "") -> None:
+                 reasoning: str = "", cache: str = "",
+                 prediction: str = "") -> None:
     """写一条通用 LLM 调用日志。
 
     kind：'round' | 'merge' | 'summary' | 'wiki_discovery' | 'wiki_rewrite' 等。
     记录完整交付消息与原始响应（含成功/失败标记），滚动保留 MAX_LLM_LOGS 条。
     cache：缓存命中统计行（llm._cache_stats 生成，如「缓存命中: hit=1536
     miss=5662 命中率=21.3% (总 7198)」），空串不记录。
+    prediction：缓存命中预测行（cache_predict.format_prediction 生成，如
+    「缓存预测(文本上限): hit≈… miss≈… 断点=…」），空串不记录。
     由 llm.call_llm 统一调用——所有 LLM 调用经此接口即自动留痕。
     """
     if not is_enabled():
@@ -129,6 +132,7 @@ def log_llm_call(kind: str, prompt: str, response: str,
     head = (f"【LLM 调用日志】kind={kind} | ok={'✓' if ok else '✗'}\n"
             f"note: {note}\n"
             f"time: {now.isoformat(timespec='seconds')}\n"
+            + (f"prediction: {prediction}\n" if prediction else "")
             + (f"cache: {cache}\n" if cache else "")
             + "----------------------------------------\n"
             "【交付给 LLM 的消息】\n")
@@ -306,13 +310,18 @@ def selftest() -> None:
         log_round([{"role": "system", "content": "p"}],
                   raw_reply={"choices": [{"message": {"content": "x"}}]}, parsed=None)
         assert "（端点未返回缓存字段）" in read_log(list_logs()[-1])
-        # 通用 LLM 调用日志：cache 参数写入文件头
-        log_llm_call("merge", "prompt-x", "resp-y", cache="缓存命中: hit=1 miss=2 命中率=33.3% (总 3)")
+        # 通用 LLM 调用日志：cache / prediction 参数写入文件头
+        log_llm_call("merge", "prompt-x", "resp-y",
+                     cache="缓存命中: hit=1 miss=2 命中率=33.3% (总 3)",
+                     prediction="缓存预测(文本上限): hit≈1 miss≈2 断点=提示词头")
         llm_files = sorted(LOG_DIR.glob("llm_*.txt"))
         assert llm_files, "应生成 llm_ 日志"
         assert "cache: 缓存命中: hit=1 miss=2" in llm_files[-1].read_text(encoding="utf-8")
+        assert "prediction: 缓存预测(文本上限): hit≈1 miss≈2 断点=提示词头" \
+            in llm_files[-1].read_text(encoding="utf-8"), "prediction 行应写入文件头"
         print(f"[logutil.selftest] 通过 ✓ 保留 {len(files)} 条 | "
-              f"最旧含 prompt-2，最新含 prompt-11 | 缓存命中记录 ✓")
+              f"最旧含 prompt-2，最新含 prompt-11 | 缓存命中记录 ✓ | "
+              f"缓存预测行 ✓")
     finally:
         globals()["LOG_DIR"] = saved
         import shutil
