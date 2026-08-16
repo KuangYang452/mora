@@ -103,8 +103,9 @@ def call_llm(messages: list, *, tools: list = None, kind: str = "round",
     client = ChatClient(llm_cfg=cfg)
     prompt_log = _fmt_messages_for_log(messages)
     # 缓存命中预测：发送前与最近几次请求比较公共前缀（128-token 块对齐，
-    # 文本前缀上限，见 cache_predict）；记录预期命中/未命中与断点位置。
-    pred = cache_predict.predictor.predict(kind, prompt_log)
+    # 文本前缀上限；总数含工具 schema token，与 API prompt_tokens 同口径，
+    # 见 cache_predict）；记录预期命中/未命中与断点位置。
+    pred = cache_predict.predictor.predict(kind, prompt_log, tools=tools)
     pred_line = cache_predict.format_prediction(pred) if pred else ""
     print(f"\n{'=' * 20} LLM 调用 [{kind}] {'=' * 20}")
     if note:

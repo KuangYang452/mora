@@ -19,8 +19,11 @@
   完整复用上一请求（同轮重试）时用其实际 `prompt_tokens` 按块精确化
   （实测同场景命中 97.7%）。分词优先用 DeepSeek 标准分词器
   （`deepseek-tokenizer`，PyPI/AndersonBY，自带 128K 词表，纯 Python 无
-  第三方运行时依赖；无工具消息实测与 API 计数吻合 ±0.2%），未安装时退回
-  字符类别估算（CJK≈1.0/ASCII≈0.28）；断点位置始终字符级精确。
+  第三方运行时依赖），未安装时退回字符类别估算（CJK≈1.0/ASCII≈0.28）；
+  总数 = 文本 + 工具 schema token（tools 经 ensure_ascii=False 序列化后
+  分词、按文本记忆化），实测与 API 的 `prompt_tokens` 偏差约 ±3%（无工具
+  消息 ±0.2%）；工具位于 API 提示词末尾，前缀断裂时计入未命中侧，与 API
+  记账一致；断点位置始终字符级精确。
 
 - **提示词篇幅预算**（`llm_prompt.py` / `debug.py` / `llm.py`，README「架构」
   约定 7 的机器可执行形态）：`prompt_budget()` 单一预算表（预算 = 2026-08

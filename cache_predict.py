@@ -20,13 +20,19 @@
 分词：优先用 DeepSeek 官方分词器（`deepseek-tokenizer`，PyPI/AndersonBY，
 自带 128K 词表 tokenizer.json，纯 Python 无第三方运行时依赖）——对真实
 请求文本实测与 API 计数吻合（无工具消息 ±0.2%）；不可用（未安装）时退回
-按字符类别标定的本地估算（CJK≈1.0 / ASCII≈0.28 / 其他≈0.85）。注意：
-预测统计的是提示词文本本身的 token，不含工具 schema 与消息序列化开销
-（API 的 prompt_tokens 含这些，round 场景实测文本侧约低 27~32%）；断点
-位置始终字符级精确，不受分词方式影响。
+按字符类别标定的本地估算（CJK≈1.0 / ASCII≈0.28 / 其他≈0.85）。断点位置
+始终字符级精确，不受分词方式影响。
+
+总数口径：`总 = 提示词文本 token + 工具 schema token`（tools 经
+`json.dumps(..., ensure_ascii=False)` 序列化后分词，实测与 API 的
+prompt_tokens 偏差约 ±3%）。工具 schema 位于 API 提示词**末尾**（实测
+post-merge 命中 1536 < 工具 schema 2585 token，证明前缀断裂时工具计入
+未命中侧），故命中只按文本前缀计算、工具始终计入未命中——与 API 记账
+一致。
 """
 
 import datetime as _dt
+import json
 import re
 from collections import deque
 
@@ -36,6 +42,7 @@ from collections import deque
 
 _tokenizer = None          # DeepSeekTokenizer 单例（惰性加载）
 _tokenizer_checked = False
+_tools_tokens_cache = {}   # 工具 schema JSON 文本 → token 数（按文本记忆化）
 
 
 def _load_deepseek_tokenizer():
@@ -65,6 +72,24 @@ def _tokenize(text: str) -> int:
         except Exception:
             pass
     return estimate_tokens(text)
+
+
+def tools_tokens(tools: list) -> int:
+    """工具 schema 的 token 数（与 API 计入 prompt_tokens 的口径一致）。
+
+    tools 经 json.dumps(ensure_ascii=False) 序列化后分词；按序列化文本
+    记忆化（同一工具清单重复调用不重复分词）。tools 为空返回 0。
+    实测：14 个工具 schema ≈ 2585 token；文本+工具合计与 API 的
+    prompt_tokens 偏差约 ±3%（消息序列化开销已含在内，无工具时 ±0.2%）。
+    """
+    if not tools:
+        return 0
+    text = json.dumps(tools, ensure_ascii=False)
+    n = _tools_tokens_cache.get(text)
+    if n is None:
+        n = _tokenize(text)
+        _tools_tokens_cache[text] = n
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -184,15 +209,16 @@ class CachePredictor:
         self._history.append((kind, time or _dt.datetime.now().strftime("%H:%M:%S"),
                               prompt, actual_tokens))
 
-    def predict(self, kind: str, prompt: str) -> dict or None:
+    def predict(self, kind: str, prompt: str,
+                tools: list = None) -> dict or None:
         """预期缓存命中信息；无历史请求时返回 None。
 
         返回 {hit, miss, total, ratio, section, snippet, prev_kind,
-        prev_time}：hit/miss 为按 128-token 块向下取整的 token 数（文本
-        前缀上限；完整复用上一请求时用其实际 token 数精确化）；total 为
-        提示词文本本身的 token 数（deepseek-tokenizer 精确分词，不含工具
-        schema 与消息序列化开销）；section/snippet 为断点（未命中部分
-        开头）所在段与文本片段。
+        prev_time}：total = 提示词文本 token + 工具 schema token（与 API
+        的 prompt_tokens 同口径，实测偏差约 ±3%）；hit 为按 128-token 块
+        向下取整的文本前缀 token（工具在 API 提示词末尾，前缀断裂时计入
+        未命中侧，故 hit 不含工具；完整复用上一请求时用其实际 token 数
+        精确化）；section/snippet 为断点（未命中部分开头）所在段与片段。
         """
         best = None
         for pk, pt, pp, ptok in self._history:
@@ -202,7 +228,7 @@ class CachePredictor:
         if best is None:
             return None
         lcp, pk, pt, pp, ptok = best
-        total = _tokenize(prompt)
+        total = _tokenize(prompt) + tools_tokens(tools)
         if ptok and lcp >= len(pp):          # 完整复用上一请求：用实际 token 精确化
             hit = (ptok // _BLOCK_TOKENS) * _BLOCK_TOKENS
         else:
@@ -296,6 +322,23 @@ def selftest() -> None:
     pred7 = p6.predict("round", "提示词B" * 60 + "追加")
     assert pred7["hit"] % 128 == 0
     print("  实际 token 锚点: 完整复用 → floor128(实际) 精确命中 ✓")
+
+    # 工具 schema token：计入总数（与 API prompt_tokens 同口径，实测 ±3%）
+    assert tools_tokens(None) == 0 and tools_tokens([]) == 0
+    fake_tools = [{"type": "function", "function": {
+        "name": "say", "description": "说出台词",
+        "parameters": {"type": "object",
+                       "properties": {"text": {"type": "string"}},
+                       "required": ["text"]}}}]
+    n_tools = tools_tokens(fake_tools)
+    assert n_tools > 0
+    assert tools_tokens(fake_tools) == n_tools, "同一工具清单应记忆化（不重复分词）"
+    p7 = CachePredictor()
+    p7.observe("round", "你好" * 100)
+    pred8 = p7.predict("round", "你好" * 100 + "追加", tools=fake_tools)
+    assert pred8["total"] == pred8["miss"] + pred8["hit"]
+    assert pred8["total"] >= n_tools, "总数应含工具 schema token"
+    print("  工具 schema: 计入总数（API 同口径，记忆化）✓")
 
     # 断点定位：前缀在系统段中断 → 段名 + 片段
     sys_prompt = ("────── SYSTEM ──────\n【你的身份与世界观】\n你是莫拉\n"
