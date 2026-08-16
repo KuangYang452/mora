@@ -102,10 +102,10 @@ def call_llm(messages: list, *, tools: list = None, kind: str = "round",
         tool_choice = settings.app_get("tool_choice", "auto")
     client = ChatClient(llm_cfg=cfg)
     prompt_log = _fmt_messages_for_log(messages)
-    # 缓存命中预测：发送前与最近几次请求比较公共前缀（128-token 块对齐，
-    # 文本前缀上限；总数含工具 schema token，与 API prompt_tokens 同口径，
-    # 见 cache_predict）；记录预期命中/未命中与断点位置。
-    pred = cache_predict.predictor.predict(kind, prompt_log, tools=tools)
+    # 缓存命中预测：发送前与最近几次请求比较消息级共享前缀（计数口径 =
+    # 官方聊天模板化的 messages + 工具 schema，与 API prompt_tokens 对齐，
+    # 128-token 块对齐；断点片段为模板文本，tokenizer 视角；见 cache_predict）
+    pred = cache_predict.predictor.predict(kind, messages, tools=tools)
     pred_line = cache_predict.format_prediction(pred) if pred else ""
     print(f"\n{'=' * 20} LLM 调用 [{kind}] {'=' * 20}")
     if note:
@@ -116,6 +116,7 @@ def call_llm(messages: list, *, tools: list = None, kind: str = "round",
     # 同步串行：全部 LLM 调用排队（持锁期间后续 call_llm 阻塞等待），
     # 避免回合/合并/摘要/wiki 重写并发交错，也避免同刻多个请求打 API。
     used_tokens = None   # 本次实际 prompt_tokens（成功且有 usage 时记录）
+    used_hit = None      # 本次实际缓存命中 token 数（同上；供下次推算实际断点）
     with _LLM_CALL_LOCK:
         try:
             if retry:
@@ -128,13 +129,26 @@ def call_llm(messages: list, *, tools: list = None, kind: str = "round",
             resp_text = json.dumps(resp, ensure_ascii=False, indent=2)
             reasoning_text = extract_reasoning(resp)
             cache_line = _cache_stats(resp)
-            used_tokens = (resp.get("usage") or {}).get("prompt_tokens")
+            usage = resp.get("usage") or {}
+            used_tokens = usage.get("prompt_tokens")
+            used_hit = usage.get("prompt_cache_hit_tokens")
+            if used_hit is None:
+                used_hit = (usage.get("prompt_tokens_details") or {}).get(
+                    "cached_tokens")
+            # 拿到响应后：用真实 usage 计算实际断点（服务端保留量随同前缀
+            # 重复请求增长，发送前无法外推——见 cache_predict.actual_break）
+            act = cache_predict.actual_break(messages, used_hit, used_tokens)
+            act_line = cache_predict.format_actual(act) if act else ""
+            log_llm_cache = (cache_line if not act_line
+                             else cache_line + "\n" + act_line)
             logutil.log_llm_call(kind, prompt_log, resp_text, ok=True,
                                  note=note, reasoning=reasoning_text,
-                                 cache=cache_line, prediction=pred_line)
+                                 cache=log_llm_cache, prediction=pred_line)
             print(f"{'=' * 20} LLM 响应 [{kind}] {'=' * 20}")
             if cache_line:
                 print(cache_line)
+            if act_line:
+                print(act_line)
             if reasoning_text:
                 print("【LLM 推理内容】")
                 print(reasoning_text)
@@ -148,10 +162,12 @@ def call_llm(messages: list, *, tools: list = None, kind: str = "round",
             print(f"{type(exc).__name__}: {exc}")
             raise
         finally:
-            # 无论成败都记录本次提示词（成功时附实际 token 数，供下一条
-            # 完整复用场景精确预测）：下一次预测与最近一次已发送请求比较
-            cache_predict.predictor.observe(kind, prompt_log,
-                                            actual_tokens=used_tokens)
+            # 无论成败都记录本次 messages（成功时附实际 token 数与实测命中，
+            # 供下一条完整复用场景精确预测与推算实际断点）：下一次预测与
+            # 最近一次已发送请求比较
+            cache_predict.predictor.observe(kind, messages,
+                                            actual_tokens=used_tokens,
+                                            actual_hit=used_hit)
 
 
 def _build_tools() -> list:
