@@ -17,15 +17,55 @@
 命中不到（见日志 hit 长期 2944）；实际命中由响应 usage 记录，同一日志
 行的 prediction 与实际 cache 两相对照即可校准偏差。
 
-分词：无官方 DeepSeek 分词器依赖（仓库离线、不引入 tokenizers）时，用按
-字符类别标定的本地估算（CJK≈1.0 / ASCII≈0.28 / 其他≈0.85 token/字符，
-对真实回合日志实测误差约 ±5%）。断点位置来自字符级公共前缀，与估算无关、
-始终精确；接入真实分词器只需替换 estimate_tokens 实现。
+分词：优先用 DeepSeek 官方分词器（`deepseek-tokenizer`，PyPI/AndersonBY，
+自带 128K 词表 tokenizer.json，纯 Python 无第三方运行时依赖）——对真实
+请求文本实测与 API 计数吻合（无工具消息 ±0.2%）；不可用（未安装）时退回
+按字符类别标定的本地估算（CJK≈1.0 / ASCII≈0.28 / 其他≈0.85）。注意：
+预测统计的是提示词文本本身的 token，不含工具 schema 与消息序列化开销
+（API 的 prompt_tokens 含这些，round 场景实测文本侧约低 27~32%）；断点
+位置始终字符级精确，不受分词方式影响。
 """
 
 import datetime as _dt
 import re
 from collections import deque
+
+# ---------------------------------------------------------------------------
+# token 计数：deepseek-tokenizer（真实分词）→ 失败时字符类别估算
+# ---------------------------------------------------------------------------
+
+_tokenizer = None          # DeepSeekTokenizer 单例（惰性加载）
+_tokenizer_checked = False
+
+
+def _load_deepseek_tokenizer():
+    """惰性加载 deepseek-tokenizer（PyPI，AndersonBY/deepseek-tokenizer）。
+
+    模块级 ds_token 在 import 时即加载 6.4MB tokenizer.json，故只在首次
+    需要时导入；导入失败（依赖未安装）返回 None，调用方退回估算。
+    """
+    global _tokenizer, _tokenizer_checked
+    if _tokenizer_checked:
+        return _tokenizer
+    _tokenizer_checked = True
+    try:
+        from deepseek_tokenizer import ds_token
+        _tokenizer = ds_token
+    except Exception:
+        _tokenizer = None
+    return _tokenizer
+
+
+def _tokenize(text: str) -> int:
+    """DeepSeek 标准分词计 token；分词器不可用时用 estimate_tokens 估算。"""
+    tok = _load_deepseek_tokenizer()
+    if tok is not None:
+        try:
+            return len(tok.encode(text, add_special_tokens=False))
+        except Exception:
+            pass
+    return estimate_tokens(text)
+
 
 # ---------------------------------------------------------------------------
 # token 估算（DeepSeek 分词近似；无官方分词器时的本地标定）
@@ -45,8 +85,8 @@ _RING = 4            # 参与比对的最近请求数（服务端缓存保留最
 def estimate_tokens(text: str) -> int:
     """估算文本在 DeepSeek 分词下的 token 数（本地近似，误差约 ±10%）。
 
-    按字符类别累加（CJK/ASCII/其他），标定见模块 docstring。只用于命中/
-    未命中的量级估算；断点位置（字符级公共前缀）不受估算影响。
+    按字符类别累加（CJK/ASCII/其他），标定见模块 docstring。只用于
+    deepseek-tokenizer 不可用时的兜底；断点位置不受估算影响。
     """
     cjk = ascii_n = other = 0
     for ch in text:
@@ -148,9 +188,11 @@ class CachePredictor:
         """预期缓存命中信息；无历史请求时返回 None。
 
         返回 {hit, miss, total, ratio, section, snippet, prev_kind,
-        prev_time}：hit/miss 为按 128-token 块向下取整的估算值（文本前缀
-        上限；完整复用上一请求时用其实际 token 数精确化）；section/snippet
-        为断点（未命中部分开头）所在段与文本片段。
+        prev_time}：hit/miss 为按 128-token 块向下取整的 token 数（文本
+        前缀上限；完整复用上一请求时用其实际 token 数精确化）；total 为
+        提示词文本本身的 token 数（deepseek-tokenizer 精确分词，不含工具
+        schema 与消息序列化开销）；section/snippet 为断点（未命中部分
+        开头）所在段与文本片段。
         """
         best = None
         for pk, pt, pp, ptok in self._history:
@@ -160,11 +202,11 @@ class CachePredictor:
         if best is None:
             return None
         lcp, pk, pt, pp, ptok = best
-        total = estimate_tokens(prompt)
+        total = _tokenize(prompt)
         if ptok and lcp >= len(pp):          # 完整复用上一请求：用实际 token 精确化
             hit = (ptok // _BLOCK_TOKENS) * _BLOCK_TOKENS
         else:
-            hit = (estimate_tokens(prompt[:lcp]) // _BLOCK_TOKENS) * _BLOCK_TOKENS
+            hit = (_tokenize(prompt[:lcp]) // _BLOCK_TOKENS) * _BLOCK_TOKENS
         hit = min(hit, total)
         return {
             "hit": hit,
@@ -208,7 +250,24 @@ def selftest() -> None:
     # 估算单调性与量级：CJK 为主文本每字符约 1.0 token
     assert 900 < estimate_tokens("汉" * 1000) <= 1000, estimate_tokens("汉" * 1000)
     assert 240 < estimate_tokens("a" * 1000) < 320, estimate_tokens("a" * 1000)
-    print("  token 估算: CJK≈1.0 / ASCII≈0.28（量级与单调性）✓")
+    print("  token 估算: CJK≈1.0 / ASCII≈0.28（量级与单调性，兜底路径）✓")
+
+    # 真实分词器（deepseek-tokenizer，PyPI）：已安装则验证词表/往返一致；
+    # 未安装（离线环境）跳过——估算兜底路径已在上方覆盖
+    tok = _load_deepseek_tokenizer()
+    if tok is not None:
+        assert tok.vocab_size == 129283, f"词表应为 128K(+3)={tok.vocab_size}"
+        text = "你好世界，今天天气不错。Cache hit!"
+        ids = tok.encode(text, add_special_tokens=False)
+        assert ids and tok.decode(ids, skip_special_tokens=True) == text, \
+            "encode/decode 往返应一致"
+        n = _tokenize(text)
+        assert 0 < n <= len(text) * 2, n
+        # 与估算的量级一致性：同一文本真实分词应远小于字符数
+        assert _tokenize("汉" * 1000) <= 1000, _tokenize("汉" * 1000)
+        print(f"  deepseek-tokenizer: vocab={tok.vocab_size} 往返一致 ✓（真实分词路径）")
+    else:
+        print("  deepseek-tokenizer: 未安装，走估算兜底 ✓")
 
     # 无历史 → None；首条记录后 → 全 miss；同前缀 → 命中块对齐
     p = CachePredictor()
@@ -226,7 +285,7 @@ def selftest() -> None:
 
     # 完整复用上一请求（同轮修复重试场景）：用其实际 token 数精确化命中
     p5 = CachePredictor()
-    prev_long = "提示词" * 3000                      # ≈9000 字符，估算总量 > 7296
+    prev_long = "提示词" * 5000                     # 真实分词约 1~1.5 万 token > 7296
     p5.observe("round", prev_long, actual_tokens=7420)
     pred6 = p5.predict("round", prev_long + "追加内容")
     assert pred6["hit"] == 7296, f"应精确命中 floor128(7420)=7296，实际 {pred6['hit']}"

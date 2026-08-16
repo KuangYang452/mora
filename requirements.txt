@@ -2,6 +2,11 @@
 requests
 pillow
 
+# DeepSeek 标准分词（cache_predict 缓存命中预测用；PyPI：AndersonBY/
+# deepseek-tokenizer，自带 128K 词表、纯 Python 无第三方运行时依赖；
+# 未安装时 cache_predict 自动退回本地字符类别估算）
+deepseek-tokenizer
+
 # 可选：OCR（游戏文本读取降级通道，rmgame_cdp_enabled=false 时用）
 # 需另装系统 Tesseract OCR（含 chi_sim 语言包）
 # pytesseract
