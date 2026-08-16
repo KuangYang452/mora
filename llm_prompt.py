@@ -68,6 +68,13 @@ def activation_instruction() -> str:
             f"{USER_REFERENCE}正在玩 RPG Maker 游戏时，回答前先按随游戏环境段注入的"
             "【游戏点评规则】执行先查再答，不得凭空脑补游戏设定。\n"
         )
+    # 角色议程：贴近输出处重复一行（近因效应；正文唯一来源 = identity.json
+    # 契约字段 agenda，渲染进【你的身份与世界观】段——与内容模式裸标记同为
+    # 约定 7 的「关键规则贴近输出重复一次」，两处同源、不产生双源）。
+    # 占位符与身份段同通道实例化（_instantiate，{{user}} → USER_REFERENCE）。
+    ag = _CHAR.agenda
+    if ag:
+        text += f"你的角色议程：{_instantiate(ag)}\n"
     return text
 
 # 思维链风格指令：参照 DeepSeek-V4 角色扮演思考模式切换指南
@@ -511,7 +518,9 @@ def _static_parts(card: dict) -> list:
         listed_skills = {k: v for k, v in listed_skills.items()
                          if k != "game_context"}
     skills_desc = "、".join(
-        f"「{k}」({v['desc']}；{v['trigger_hint']})" for k, v in listed_skills.items())
+        f"「{k}」({v['desc']}；{v['trigger_hint']}"
+        + (f"；{v['close_hint']}" if v.get("close_hint") else "")
+        + ")" for k, v in listed_skills.items())
     proto = (
         "【每回合的行为方式】\n"
         "你的一切输出都必须通过工具完成，不得输出工具之外的文本：\n"
@@ -973,7 +982,7 @@ def selftest() -> None:
     assert act_skill.count("</thinking_format>") == 1, act_skill
     assert "<think>" not in act_skill, "不应使用 DeepSeek 思考输出标记包裹模板"
     assert "素材来源" in act_skill and "read_current_text" in act_skill, "应含素材获取引导"
-    assert "收敛判断" in act_skill and "关闭性癖测试技能" in act_skill, "应含收敛/关闭引导"
+    assert "收敛判断" in act_skill and "关闭方式" in act_skill, "应含收敛/关闭引导"
     assert "0. 检查上回的堕落进度" in act_skill, "原型步骤应原样保留"
     assert "<thinking_format>" not in build_activation(st0, card), "默认激活指令不含心理COT"
     assert "<think>" not in sys_prompt_skill and "<thinking_format>" not in sys_prompt_skill, \
@@ -1014,6 +1023,12 @@ def selftest() -> None:
     act_default = build_activation(st0, card)
     assert act_default.startswith("内容模式:NSFW\n"), act_default
     assert act_default.count("内容模式:NSFW") == 1, act_default
+    # 角色议程：契约字段渲染进身份段 + 激活指令尾部贴近输出重复（同源，见约定 7）
+    if session._CHAR.agenda:
+        assert "角色议程：" in sys_prompt, \
+            "角色议程应渲染进【你的身份与世界观】段（identity.json 契约 agenda）"
+        assert "你的角色议程：" in act_default, \
+            "角色议程应在激活指令尾部贴近输出重复（近因效应）"
     _saved_mode = content_mode.CONTENT_MODE
     try:
         content_mode.CONTENT_MODE = "sfw"

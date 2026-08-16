@@ -259,6 +259,8 @@ def build_identity_template(card: dict) -> dict:
         "world": world,
         "personality": personality,
         "background": background,
+        # 角色议程（可选）：长期动机/目标；原型无直接来源，留空待人工填写
+        "agenda": "",
     }
     for src, dst in (("social_connections", "relationships"),
                      ("special_abilities", "abilities"),

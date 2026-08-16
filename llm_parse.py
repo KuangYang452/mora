@@ -289,8 +289,9 @@ def tool_result_text(state: dict) -> str:
     if active:
         text += (
             f"\n提示：技能（{'、'.join(active)}）仍处于激活状态。"
-            "话题结束或离开后，请在下次调用 update_state 时把 skills "
-            "设为空数组以关闭它。"
+            "分析结论已交付、或对方澄清无意/拒绝分析、话题已离开时，"
+            "请立即在下次调用 update_state 时把 skills 设为空数组关闭；"
+            "不得为继续收集信息而保留激活。"
         )
     return text
 
@@ -364,8 +365,8 @@ def selftest() -> None:
     rst_skill = tool_result_text({"affection": 20, "inner_thought": "x", "skills": ["fetish_analysis"]})
     assert "fetish_analysis" in rst_skill and "调用 say 工具说出台词" in rst_skill, rst_skill
     # 显性关闭提示：技能激活时回传应提醒关闭方式；未激活不出现
-    assert "设为空数组以关闭它" in rst_skill, "应含显性关闭提示"
-    assert "设为空数组以关闭它" not in rst, "未激活技能不应有关闭提示"
+    assert "设为空数组关闭" in rst_skill, "应含显性关闭提示"
+    assert "设为空数组关闭" not in rst, "未激活技能不应有关闭提示"
     assert "affection_delta" not in rst, "工具结果不应暴露代码字段名"
     print("  agent 循环: 工具调用提取 / 语义化结果回传（不暴露字段名）✓")
 

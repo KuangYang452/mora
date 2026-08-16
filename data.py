@@ -64,10 +64,14 @@ GAME_RULES = (
 # 每回合随环境快照重建）。
 SKILLS = {
     "fetish_analysis": {
-        "desc": f"性癖分析：以研究者身份引导{USER_REFERENCE}探索与分析性癖",
-        "trigger_hint": f"当{USER_REFERENCE}本人主动谈论自身的性癖、欲望、XP、心理困扰，"
+        "desc": f"性癖分析（结算技能）：对{USER_REFERENCE}已袒露的性癖/欲望/XP做一次性分析并交付结论，"
+                f"不是收集素材的常驻技能",
+        "trigger_hint": f"仅当{USER_REFERENCE}本人主动谈论自身的性癖、欲望、XP、心理困扰，"
                        f"或明确请求你做性癖/心理分析时，激活此技能；"
                        f"仅谈论游戏剧情/角色设定、或{USER_REFERENCE}只是在玩游戏时，不要激活",
+        "close_hint": f"分析结论一经交付、或{USER_REFERENCE}澄清无意/拒绝分析/话题已离开时，"
+                      f"立即在下次 update_state 把 skills 置空数组关闭；"
+                      f"不得为继续收集信息而保留激活",
         # 内容评级：仅 NSFW 模式可用。技能（角色层内容）声明自身对内容模式
         # 开关的依赖，开关按此属性做通用过滤（见 llm._mode_allowed_skills），
         # 不依赖任何具体技能名——依赖方向见 README「架构」约定 8（技能 → 开关）。
